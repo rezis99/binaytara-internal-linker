@@ -1,0 +1,270 @@
+"""HTML to structured page record.
+
+Highest-risk module in the build. The body-container choice determines which
+links count as body links (R7) and which text is eligible for placement.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup
+
+from config import selectors as sel
+from config import settings
+from config import url_rules as ur
+from indexer.blocks import Block, classify
+
+
+def _text(el) -> str:
+    return re.sub(r"\s+", " ", el.get_text(" ", strip=True)).strip()
+
+
+def _link_text_ratio(el) -> float:
+    total = len(_text(el))
+    if total == 0:
+        return 1.0
+    linked = sum(len(_text(a)) for a in el.find_all("a"))
+    return linked / total
+
+
+def pick_body(soup: BeautifulSoup):
+    """First selector yielding enough prose and not dominated by links."""
+    for css in sel.BODY_SELECTORS:
+        for el in soup.select(css):
+            clone = BeautifulSoup(str(el), "lxml")
+            strip_junk(clone)
+            txt = _text(clone)
+            if len(txt) >= settings.MIN_BODY_CHARS and \
+                    _link_text_ratio(clone) < settings.MAX_LINK_TEXT_RATIO:
+                return clone
+    return None
+
+
+def strip_junk(soup) -> None:
+    for css in sel.JUNK_SELECTORS:
+        for el in soup.select(css):
+            el.decompose()
+
+
+def _collect_links(el, base: str) -> list[tuple[str, str]]:
+    out = []
+    for a in el.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        absolute = urljoin(base, href)
+        anchor = _text(a)
+        out.append((absolute, anchor))
+    return out
+
+
+def _bold_cover(el, txt: str) -> float:
+    """Proportion of a block's text that is bold."""
+    if not txt:
+        return 0.0
+    bold = " ".join(_text(b) for b in el.find_all(["strong", "b"]))
+    return len(bold) / len(txt)
+
+
+def is_pseudo_heading(el, txt: str) -> bool:
+    """TCN article bodies use fully-bold short paragraphs as section headings
+    rather than real <h2> tags. Verified on live pages. Without treating these
+    as headings, Key Takeaways and References regions are never detected and
+    heading_context is always empty."""
+    if el.name != "p":
+        return False
+    if len(txt.split()) > sel.PSEUDO_HEADING_MAX_WORDS:
+        return False
+    return _bold_cover(el, txt) >= sel.PSEUDO_HEADING_BOLD_COVER
+
+
+def blocks_from_body(body, base: str) -> list[Block]:
+    blocks, idx = [], 0
+    for el in body.find_all(sel.BLOCK_TAGS):
+        # Skip nested blocks (e.g. <p> inside <blockquote>) to avoid duplication.
+        if el.find_parent(sel.BLOCK_TAGS) is not None:
+            continue
+        txt = _text(el)
+        if not txt:
+            continue
+        kind = "h2" if is_pseudo_heading(el, txt) else el.name
+        blocks.append(Block(index=idx, kind=kind, text=txt,
+                            links=_collect_links(el, base)))
+        idx += 1
+    return blocks
+
+
+def _meta(soup, name: str) -> str:
+    tag = soup.find("meta", attrs={"name": name}) or \
+        soup.find("meta", attrs={"property": name})
+    return (tag.get("content") or "").strip() if tag else ""
+
+
+def _find_abstract(soup) -> str:
+    for css in sel.ABSTRACT_SELECTORS:
+        el = soup.select_one(css)
+        if el:
+            t = _text(el)
+            if len(t) > 80:
+                return t
+    # Fallback: blocks following a heading that reads exactly "Abstract".
+    for h in soup.find_all(["h1", "h2", "h3"]):
+        if re.match(r"^\s*abstract\s*$", _text(h), re.I):
+            parts, node = [], h.find_next_sibling()
+            while node is not None and node.name not in ("h1", "h2", "h3"):
+                if node.name in ("p", "div"):
+                    parts.append(_text(node))
+                node = node.find_next_sibling()
+            joined = " ".join(p for p in parts if p)
+            if len(joined) > 80:
+                return joined
+    return ""
+
+
+def _event_dates(html: str) -> dict | None:
+    """Pull Event startDate / endDate from JSON-LD."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            try:
+                payload = json.loads(tag.string or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            items = payload if isinstance(payload, list) else [payload]
+            if isinstance(payload, dict) and "@graph" in payload:
+                items = payload["@graph"]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                t = item.get("@type", "")
+                types = t if isinstance(t, list) else [t]
+                if any("event" in str(x).lower() for x in types):
+                    if item.get("startDate") or item.get("endDate"):
+                        return {
+                            "startDate": item.get("startDate"),
+                            "endDate": item.get("endDate") or item.get("startDate"),
+                            "name": item.get("name"),
+                        }
+    except Exception:
+        return None
+    return None
+
+
+BRAND_TOKENS = {"the cancer news", "binaytara", "ijccd", "binaytara foundation"}
+
+
+def strip_brand(title: str) -> str:
+    """Drop brand segments. Titles use the brand mid-string as well as at the
+    end ('X | Binaytara | Y'), so split on separators rather than replacing."""
+    if not title:
+        return ""
+    parts = re.split(r"\s*[|\u2502]\s*", title)
+    kept = [p.strip() for p in parts if p.strip().lower() not in BRAND_TOKENS]
+    out = " | ".join(p for p in kept if p)
+    return re.sub(r"\s+", " ", out).strip(" |\u2502-").strip() or title.strip()
+
+
+def person_name_variants(full_name: str) -> list[str]:
+    """Name forms R10 will match against. Surname-only entries are marked so the
+    rule engine can demand an adjacent title or credential."""
+    full_name = re.sub(r"\s+", " ", (full_name or "").strip())
+    full_name = re.sub(r",?\s*(MD|PhD|DO|MPH|RN|DNB|MBBS)\b\.?", "", full_name, flags=re.I).strip()
+    if not full_name:
+        return []
+    out = {full_name, f"Dr. {full_name}", f"Dr {full_name}"}
+    parts = full_name.split()
+    if len(parts) == 3 and re.fullmatch(r"[A-Z]\.?", parts[1]):
+        out.add(f"{parts[0]} {parts[2]}")
+    if len(parts) == 2:
+        out.add(f"SURNAME_ONLY::{parts[1]}")
+    return sorted(out)
+
+
+def extract(html: str, final_url: str) -> dict | None:
+    """Return a page record, or None when the page has no usable body."""
+    soup = BeautifulSoup(html, "lxml")
+
+    title = _text(soup.title) if soup.title else ""
+    og_title = _meta(soup, "og:title")
+    h1_el = soup.find("h1")
+    h1 = _text(h1_el) if h1_el else ""
+    meta_desc = _meta(soup, "description")
+    placeholder = meta_desc.strip().lower() == sel.IJCCD_PLACEHOLDER_META
+    canonical_el = soup.find("link", rel="canonical")
+    canonical = (canonical_el.get("href") or "").strip() if canonical_el else ""
+
+    all_links = _collect_links(soup, final_url)
+
+    # A page with no prose body (a listing or hub page such as /journal or
+    # /cancernews/all-articles) is still a legitimate LINK TARGET even though no
+    # link can be placed inside it. It is kept as a target-only record with no
+    # placement blocks, rather than dropped from the index entirely.
+    body = pick_body(soup)
+    body_available = body is not None
+    blocks = []
+    if body_available:
+        blocks = blocks_from_body(body, final_url)
+        classify(blocks, meta_description="" if placeholder else meta_desc)
+
+    body_links, seen = [], set()
+    for b in blocks:
+        for u, _anchor in b.links:
+            n = ur.normalise(u)
+            if n and ur.is_allowed(n) and n not in seen:
+                seen.add(n)
+                body_links.append(n)
+
+    nav_links = []
+    for u, _a in all_links:
+        n = ur.normalise(u)
+        if n and ur.is_allowed(n) and n not in seen:
+            nav_links.append(n)
+
+    section = ur.section_of(final_url)
+    abstract = _find_abstract(soup) if (placeholder or not meta_desc) else ""
+    event = _event_dates(html) if section == "Conference" else None
+
+    body_text = " ".join(b.text for b in blocks)
+    if not body_available:
+        # Fall back to whatever prose the page does have, for the target summary.
+        main = soup.find("main") or soup.body
+        body_text = _text(main)[:2000] if main else ""
+    digest = hashlib.sha256(
+        "\n".join([h1, title, meta_desc, body_text]).encode("utf-8")
+    ).hexdigest()
+
+    names = person_name_variants(h1) if section == "Contributor" else []
+
+    return {
+        "url": final_url,
+        "canonical_url": ur.normalise(canonical) if canonical else None,
+        "section": section,
+        "body_available": body_available,
+        "title": title,
+        "title_clean": strip_brand(title or og_title),
+        "h1": h1,
+        "meta_description": "" if placeholder else meta_desc,
+        "meta_description_is_placeholder": placeholder,
+        "abstract": abstract,
+        "abstract_missing": bool((placeholder or not meta_desc) and not abstract),
+        "published_date": _meta(soup, "article:published_time"),
+        "modified_date": _meta(soup, "article:modified_time"),
+        "word_count": len(body_text.split()),
+        "body_internal_links": body_links,
+        "nav_internal_links": nav_links,
+        "event": event,
+        "person_names": names,
+        "inbound_link_count": 0,
+        "content_hash": digest,
+        "_blocks": [
+            {
+                "index": b.index, "kind": b.kind, "text": b.text,
+                "eligible": b.eligible, "skip_reason": b.skip_reason,
+                "heading_context": b.heading_context,
+            }
+            for b in blocks
+        ],
+    }
