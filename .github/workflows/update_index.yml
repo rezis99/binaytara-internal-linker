@@ -2,10 +2,7 @@ name: Update page index
 
 on:
   schedule:
-    # Nepal is UTC+05:45, so 06:00 NPT is 00:15 UTC on the SAME calendar day.
-    # Monday 06:00 NPT = Monday 00:15 UTC = day-of-week 1 (not 0).
     - cron: "15 0 * * 1"
-    # Wednesday 06:00 NPT = Wednesday 00:15 UTC = day-of-week 3.
     - cron: "15 0 * * 3"
   workflow_dispatch:
     inputs:
@@ -16,7 +13,7 @@ on:
 
 concurrency:
   group: update-index
-  cancel-in-progress: false      # never let two index builds race
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -35,7 +32,6 @@ jobs:
       - name: Cache the embedding model
         uses: actions/cache@v4
         with:
-          # fastembed uses its OWN cache directory, not ~/.cache/huggingface.
           path: |
             ~/.cache/fastembed
             /tmp/fastembed_cache
@@ -61,7 +57,7 @@ jobs:
           print("model:", m["model_name"], "faiss:", m["faiss_version"])
           PY
 
-            - name: Commit updated artifacts
+      - name: Commit updated artifacts
         run: |
           git config user.name  "binaytara-index-bot"
           git config user.email "actions@github.com"
