@@ -35,6 +35,13 @@ def _assert_safe_url(url: str) -> str:
     """SSRF controls. The host allowlist is the strongest one and reduces most of
     the rest to defence in depth; they are implemented anyway because the
     allowlist is one careless edit away from being loosened."""
+    # Check the RAW scheme before normalising. normalise() force-upgrades the
+    # scheme to https, which is the right behaviour for links discovered on a
+    # page but wrong for user input: it would silently accept http:// and any
+    # other scheme that happens to parse, instead of refusing it.
+    raw_scheme = (urlparse((url or "").strip()).scheme or "").lower()
+    if raw_scheme and raw_scheme != "https":
+        raise InputError("Only https URLs are accepted.")
     n = ur.normalise(url)
     if not n:
         raise InputError("That does not look like a valid URL.")

@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from datetime import date
 
+from config import selectors as sel
 from config import settings
 from config import url_rules as ur
 from engine import cannibalization, conference
@@ -79,12 +80,30 @@ def conference_ok(target_page: dict, score: float,
 
 
 # ---------------------------------------------------------------- scoring
+def keyword_evidence(tier: int, match_type: str, anchor: str) -> float:
+    """Lexical evidence floor. An exact or synonym match on a specific phrase
+    from the target's approved anchor list or H1 is independent evidence that
+    the pages share a topic, so it sets a floor under relevance rather than
+    being thrown away when the embedding is unconvincing."""
+    if tier > 2 or match_type not in ("Exact in text", "Synonym in text"):
+        return 0.0
+    words = [w for w in (anchor or "").lower().split() if w]
+    if len(words) < settings.KEYWORD_EVIDENCE_MIN_WORDS:
+        return 0.0
+    if " ".join(words) in sel.GENERIC_ANCHORS:
+        return 0.0
+    return settings.KEYWORD_EVIDENCE_FLOOR
+
+
 def final_score(semantic: float, lexical: float, anchor_score: float,
                 deorphan: bool = False, inbound: int = 0,
-                synthetic: bool = False) -> float:
-    s = (settings.W_SEMANTIC * semantic
-         + settings.W_LEXICAL * lexical
-         + settings.W_ANCHOR * anchor_score)
+                synthetic: bool = False, evidence: float = 0.0) -> float:
+    # Relevance first, anchor quality as a discount. Anchor quality says nothing
+    # about whether the target page belongs in this paragraph.
+    relevance = (settings.W_SEMANTIC * semantic + settings.W_LEXICAL * lexical) \
+        / (settings.W_SEMANTIC + settings.W_LEXICAL)
+    relevance = max(relevance, evidence)
+    s = relevance * (1.0 - settings.W_ANCHOR + settings.W_ANCHOR * anchor_score)
     if synthetic:
         s *= settings.SYNTHETIC_PENALTY
     if deorphan:
@@ -134,14 +153,25 @@ def enforce_caps(rows: list[dict]) -> list[dict]:
     return sorted(out, key=lambda r: (r["block_index"], -r["score"]))
 
 
+DRAFT_SCHEME = "draft://"
+DRAFT_PLACEHOLDER = "this article's URL once it is published"
+
+
+def display_url(url: str) -> str:
+    """An unpublished draft has no URL yet. Emitting the internal draft:// token
+    into a writer-facing instruction is useless and looks broken."""
+    return DRAFT_PLACEHOLDER if (url or "").startswith(DRAFT_SCHEME) else url
+
+
 def modified_sentence(text: str, span, anchor: str, url: str, match_type: str) -> str:
     """Markdown link inserted in place, or an instruction when the phrase is
     absent. Phase 2 replaces the instruction with an LLM rewrite."""
+    shown = display_url(url)
     if match_type == "Needs insertion" or not span:
         return (f'Writer to incorporate the phrase "{anchor}" naturally into this '
-                f"sentence, then link it to {url}")
+                f"sentence, then link it to {shown}")
     start, end = span
-    return f"{text[:start]}[{text[start:end]}]({url}){text[end:]}"
+    return f"{text[:start]}[{text[start:end]}]({shown}){text[end:]}"
 
 
 def crowding_note(page: dict) -> str:

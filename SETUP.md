@@ -20,15 +20,31 @@ Both download as one formatted Excel workbook you can hand to Bibek, Ariana or K
 The site is crawled and indexed **offline** by GitHub Actions twice a week. The
 app only loads the prebuilt index, which is what makes it fit inside a free host.
 
-**What is already verified against the live site** (September 16, 2026):
+### What is verified, and by whom
 
-| Check | Result |
+Two different things, kept separate on purpose. A maintainer reading this later
+should be able to tell which claims they can re-check themselves.
+
+**A. Reproducible from this package, on your machine, no network needed:**
+
+| Check | Command |
 |---|---|
-| Sitemap discovery | 1,680 indexable pages found across 7 sections |
-| Content extraction | Works on TCN, IJCCD, Blog, Conference, Contributor, Static |
-| Peak memory | 395 MB, against a 690 MB documented floor |
-| Unit tests | 52 of 52 passing |
+| 61 rule tests | `python tests/test_rules.py` |
+| 41 end-to-end tests: artifact load, HTML pipeline, DOCX pipeline, workbook | `python tests/test_end_to_end.py` |
+| Clean install and app boot | `pip install -r requirements.txt && streamlit run app.py` |
+
+**B. Observed against the live site during the build session (September 16, 2026),
+not reproducible without network access.** Re-measure these yourself in step 7:
+
+| Observation | Value seen |
+|---|---|
+| Sitemap discovery | 1,680 indexable pages across 7 sections |
+| Content extraction | Worked on TCN, IJCCD, Blog, Conference, Contributor, Static |
+| Peak memory, 368-page index | 395 MB, against a 690 MB documented floor |
 | Anchor guide sheet | Readable, 35 target URLs loaded |
+
+Treat column B as a starting expectation, not a guarantee. If your numbers differ
+materially, that is information about the site, not a broken tool.
 
 ---
 
@@ -93,11 +109,17 @@ source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Run the tests. All 52 must pass before you go further:
+Run both suites. Everything must pass before you go further:
 
 ```bash
-python tests/test_rules.py
+python tests/test_rules.py          # 61 rule-level checks
+python tests/test_end_to_end.py     # 41 integration checks against the shipped index
 ```
+
+The second suite is the one that matters operationally: it loads the real FAISS
+and BM25 artifacts, runs a full analysis on an HTML fixture and a DOCX fixture,
+and reopens the generated workbook. Passing rule tests alone does not prove the
+application works.
 
 The package ships with a **partial index of 368 pages**, a stratified sample
 across every section, so you can try the app immediately:
@@ -129,9 +151,23 @@ Expect 25 to 45 minutes, almost all of it embedding on CPU. You will see:
 6/6 building lexical index and writing artifacts
 ```
 
-The build **aborts without writing anything** if more than 10 percent of pages
-fail or if it detects a firewall block. A stale index is recoverable; a silently
-truncated one is not.
+The build **aborts without writing anything** if any of these trip:
+
+| Gate | Threshold |
+|---|---|
+| Crawl failures | more than 10 percent of sitemap URLs |
+| Pages fetched but unusable after extraction | more than 25 percent |
+| Page count against the previous index | dropped below 80 percent |
+| Probable firewall block | more than 5 empty 403 responses |
+
+The second one is the important one: a site template change can let every page
+return HTTP 200 and still yield nothing usable. Crawl success alone does not
+prove the index is sound. Canonical collisions, where two URLs resolve to the
+same canonical page, are counted and listed in the manifest rather than silently
+overwriting each other.
+
+A stale index is recoverable. A silently truncated one looks healthy and produces
+wrong suggestions for weeks.
 
 Commit the result:
 
@@ -202,6 +238,18 @@ The workflow is already in the repository at
 
 It then runs Monday and Wednesday at 06:00 Nepal time.
 
+**The workflow will not commit a bad index.** It runs the rule tests before
+rebuilding, then runs the end-to-end suite against the freshly written artifacts,
+and only commits if both pass. It also uploads the manifest as a workflow
+artifact and raises a warning if a build exceeds 30 minutes, well before the
+45-minute job timeout.
+
+**On the name "update".** `indexer/update_index.py` detects what changed and then
+rebuilds the entire corpus. It is not an incremental artifact update. At the
+current size that is the right trade, because a full rebuild removes a whole
+class of merge bugs. Watch `build_seconds` in the manifest; if it climbs toward
+30 minutes, that is the signal to build a real incremental path.
+
 **A note on the schedule.** Nepal is UTC+05:45, so 06:00 NPT is 00:15 UTC on the
 same day, which is cron day-of-week `1` for Monday, not `0`. The file has the
 correct values. GitHub also delays scheduled jobs under load and disables
@@ -237,8 +285,20 @@ pages to the new article, and it is the de-orphaning workflow.
 
 1. Every suggestion is a suggestion. The tool proposes; the writer decides.
 2. Do not upload patient-identifiable information or confidential or embargoed
-   manuscripts. Drafts are processed temporarily and never stored, but the app is
-   publicly reachable by anyone with the link.
+   manuscripts.
+
+**What "never stored" actually means, precisely.** The code never writes an
+upload to disk, never logs its text, and never adds it to the index. It is held
+in process memory for the duration of your session and in Streamlit session state
+until you close the tab or the app restarts. That is a statement about this
+codebase, not about the host: what a hosting provider retains in its own logs or
+infrastructure is outside the tool's control and is not something this package
+can demonstrate.
+
+So the honest position is: for published articles and ordinary drafts, the public
+app is fine. If Binaytara decides drafts routinely contain embargoed findings or
+anything patient-identifiable, the answer is a private deployment, not a warning
+banner. Make that call before writers start uploading real manuscripts, not after.
 
 ---
 
@@ -316,7 +376,7 @@ full rebuild from Actions with the `full_rebuild` input checked.
 | LLM sentence rewriting | Phase 2. "Needs insertion" rows give an instruction instead. An LLM that silently alters a survival figure while adding a hyperlink is a clinical accuracy problem, not a copy problem |
 | Batch mode at more than 1 worker | `BATCH_WORKERS = 1` until step 7 passes. The value of 4 was picked before any measurement existed |
 | Real keyword data for topic overlap | Uses an H1 proxy. A free Google Search Console or Semrush CSV export would replace it; see below |
-| Login | Agreed. The index is built from already-public pages |
+| Login | Agreed. The index is built from already-public pages. But see the retention note below: that reasoning covers the index, not uploads |
 | Orphan flagging | You asked to leave it out. The inbound count still shows in Notes |
 
 **The highest-value free upgrade is data, not hardware.** A GSC query-to-page CSV

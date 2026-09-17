@@ -74,6 +74,39 @@ BRAND_SUFFIXES = [
     "| IJCCD", "\u2502 IJCCD", "- The Cancer News", "- Binaytara",
 ]
 
+# Anchors that describe nothing about the destination. A link reading "United
+# States" or "this study" tells a reader and a search engine nothing about the
+# page it points at, which is the whole purpose of descriptive anchor text.
+GENERIC_ANCHORS = {
+    "united states", "the united states", "new york", "north america", "the us",
+    "this study", "the study", "these studies", "the trial", "this trial",
+    "the data", "the results", "the findings", "the research", "the report",
+    "recent research", "recent studies", "other studies", "some studies",
+    "the authors", "the team", "the paper", "this article", "the article",
+    "click here", "read more", "learn more", "find out", "see more",
+    "the world", "the population", "the patients", "these patients",
+    "health care", "healthcare", "medical care", "patient care",
+    "cancer cases", "cancer patients", "cancer risk", "cancer care",
+    "cancer treatment", "cancer screening", "cancer research", "cancer types",
+}
+
+# A title fragment that begins with one of these is a mid-sentence slice, not a
+# noun phrase. "Actually Makes It Through Cancer" is a real example this tool
+# produced before the guard existed.
+FRAGMENT_STARTERS = {
+    "actually", "really", "simply", "just", "also", "however", "although",
+    "because", "since", "while", "when", "where", "which", "that", "what",
+    "makes", "made", "taught", "shows", "showed", "says", "said", "tells",
+    "and", "but", "or", "with", "from", "into", "onto", "about", "after",
+    "before", "during", "through", "toward", "towards", "among", "between",
+    # Framing nouns that open an academic title but describe no topic.
+    "overview", "introduction", "update", "updates", "review", "reflections",
+    "analysis", "assessment", "evaluation", "comparison", "summary", "report",
+    "perspectives", "insights", "lessons", "notes", "commentary", "editorial",
+    "current", "recent", "emerging", "novel", "modern", "toward", "towards",
+    "implementing", "improving", "understanding", "advancing", "exploring",
+}
+
 EXTRA_STOPWORDS = {
     "binaytara", "cancer", "news", "article", "study", "report", "new", "latest",
     "using", "used", "may", "one", "two", "also",

@@ -55,6 +55,14 @@ def load(data_dir=None) -> Store:
         raise RuntimeError("Index dimension does not match settings.EMBED_DIM.")
 
     index = faiss.read_index(str(d / "faiss.index"))
+    # A vector count that disagrees with the chunk list means every retrieved id
+    # points at the wrong paragraph. That produces confident, plausible, totally
+    # wrong suggestions, which is worse than an outage. Fail closed.
+    if index.ntotal != len(chunks):
+        raise RuntimeError(
+            f"Index corrupt: FAISS holds {index.ntotal} vectors but "
+            f"paragraphs.json has {len(chunks)} chunks. Rebuild the index."
+        )
     bm25 = bm25s.BM25.load(str(d / "bm25"), load_corpus=False)
 
     by_url: dict[str, list[int]] = {}
@@ -83,6 +91,17 @@ def _expanded_tokens(text: str) -> list[str]:
             for alt in expand(phrase):
                 extra.extend(tokens(alt))
     return base + extra
+
+
+def _semantic(raw_cos: float) -> float:
+    """Rescale cosine against this corpus's measured noise floor.
+
+    (cos + 1) / 2 is wrong for BGE: unrelated chunks in this corpus sit around
+    0.56 cosine, which that mapping turns into 0.78. Anchoring on the measured
+    unrelated p95 makes the number mean something.
+    """
+    lo, hi = settings.COSINE_NOISE_FLOOR, settings.COSINE_SIGNAL_CEIL
+    return max(0.0, min(1.0, (raw_cos - lo) / (hi - lo)))
 
 
 def _rrf(rank_lists: list[list[int]]) -> dict[int, float]:
@@ -136,7 +155,7 @@ def search_chunks(store: Store, query_text: str, exclude_urls: set[str],
             "url": c["url"],
             "rrf": rrf_score,
             "raw_cosine": raw_cos,
-            "semantic_score": (raw_cos + 1.0) / 2.0,      # map [-1,1] to [0,1]
+            "semantic_score": _semantic(raw_cos),
             "raw_bm25": lex_raw.get(idx, 0.0),
             "lexical_score": (lex_raw.get(idx, 0.0) / lex_max) if lex_max else 0.0,
         })

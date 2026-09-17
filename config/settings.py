@@ -42,6 +42,24 @@ CANDIDATES_PER_CHUNK = 10
 RECEIVE_SOURCE_PAGES = 15
 
 # ---------- Scoring ----------
+# MEASURED, not assumed. Cosine similarity between 778 pairs of UNRELATED chunks
+# from this corpus (bge-small-en-v1.5): p1 0.399, p25 0.508, median 0.563,
+# p95 0.670, p99 0.719. BGE similarities live in a narrow high band, so the
+# naive (cos + 1) / 2 mapping gave two unrelated paragraphs a semantic score of
+# 0.78 and pushed almost every candidate into the Medium band. Rescale against
+# the observed noise floor instead: everything at or below the unrelated p95
+# scores zero, and only genuinely close matches earn signal.
+COSINE_NOISE_FLOOR = 0.70     # just above unrelated p99 (0.719 measured)
+COSINE_SIGNAL_CEIL = 0.82     # measured: genuinely good matches top out near here
+
+# Hard gate applied before scoring. A candidate below this is not a weak
+# suggestion, it is noise, and no anchor quality should rescue it.
+COSINE_HARD_MIN = 0.70
+
+# "Needs insertion" asks the writer to rewrite a sentence. That is only worth
+# their time when the topical match is strong, so it carries a higher bar.
+COSINE_INSERTION_MIN = 0.80
+
 W_SEMANTIC = 0.55
 W_LEXICAL = 0.25
 W_ANCHOR = 0.20
@@ -55,6 +73,20 @@ MATCH_MULTIPLIER = {
     "Partial in text": 0.80,
     "Needs insertion": 0.60,
 }
+
+# Anchor quality measures how good the ANCHOR is, not how relevant the TARGET
+# is, so it scales the relevance score rather than adding to it: it can only
+# discount a match, never rescue an irrelevant one.
+#
+# But an exact match on a SPECIFIC multi-word phrase taken from the target's own
+# H1 is not merely good anchor text, it is independent evidence that the two
+# pages share a topic. "breast cancer" appearing verbatim in a paragraph about
+# breast cancer risk, pointing at a page whose H1 is about breast cancer, is a
+# good link whatever the embedding says. Embeddings compress hard on
+# domain-specific corpora, so this lexical evidence is treated as a floor on
+# relevance rather than being discarded.
+KEYWORD_EVIDENCE_FLOOR = 0.62      # applies to Tier 1 and 2 exact/synonym matches
+KEYWORD_EVIDENCE_MIN_WORDS = 2
 
 # A hub or listing page is represented by ONE synthetic chunk built from its H1,
 # title and meta description. That text is short and keyword-dense, which gives

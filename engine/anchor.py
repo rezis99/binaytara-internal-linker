@@ -51,12 +51,21 @@ def tokens(text: str) -> list[str]:
 
 
 def ngrams(text: str, lo: int | None = None, hi: int | None = None) -> list[str]:
-    """Content-word n-grams usable as anchors."""
+    """Content-word n-grams usable as anchors.
+
+    Ordered SHORTEST first. Long n-grams taken from the middle of a title are
+    almost always mid-sentence slices rather than noun phrases, and a 2-to-3
+    word topical phrase is both a better anchor and safer against keyword
+    cannibalization than a 5-word title fragment.
+    """
     lo = lo or settings.ANCHOR_MIN_WORDS
     hi = hi or settings.ANCHOR_MAX_WORDS
-    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-']*", text or "")
-    out = []
-    for n in range(hi, lo - 1, -1):
+    # Only consider the part of a title before a colon or dash: "Prostate Cancer
+    # and Obesity: Current Hypotheses" should yield the subject, not the subtitle.
+    head = re.split(r"[:\u2013\u2014]|\s-\s", text or "")[0] or (text or "")
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-']*", head)
+    scored = []
+    for n in range(lo, hi + 1):
         for i in range(len(words) - n + 1):
             gram = words[i:i + n]
             low = [w.lower() for w in gram]
@@ -64,9 +73,22 @@ def ngrams(text: str, lo: int | None = None, hi: int | None = None) -> list[str]
                 continue
             if all(w in _STOP or w in sel.EXTRA_STOPWORDS for w in low):
                 continue
-            if low[0] in sel.SERP_VERBS:
+            if low[0] in sel.SERP_VERBS or low[0] in sel.FRAGMENT_STARTERS:
                 continue
-            out.append(" ".join(gram))
+            if " ".join(low) in sel.GENERIC_ANCHORS:
+                continue
+            # A phrase pulled from the middle of a title must still read as a
+            # noun phrase; require it to start at the title head or right after
+            # a stopword boundary.
+            if i > 0 and words[i - 1].lower() not in _STOP:
+                continue
+            scored.append((i > 0, -n, " ".join(gram)))
+
+    # Head-anchored phrases first, then longest. Without the length preference a
+    # 2-gram truncation wins over the full phrase: "head and neck cancer" would
+    # be offered as "neck cancer", which is a different disease site.
+    scored.sort()
+    out = [g for _head, _len, g in scored]
     seen, uniq = set(), []
     for g in out:
         k = g.lower()

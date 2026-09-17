@@ -1,4 +1,10 @@
-"""Incremental update. Re-fetches only new and changed pages.
+"""Change detection plus full rebuild.
+
+Named honestly: this module DETECTS what changed and then rebuilds the whole
+corpus. It is not an incremental artifact update. At the current corpus size a
+full rebuild takes minutes and removes a whole class of merge bugs, which is the
+right trade. Revisit if build_seconds in the manifest starts approaching the
+workflow timeout; the workflow already emits a warning above 30 minutes.
 
 At roughly 10 new articles a week a scheduled run touches a handful of pages.
 The FAISS index is rebuilt from the full chunk set each time: a flat index of

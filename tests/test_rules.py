@@ -100,6 +100,26 @@ def test_urls():
     check("section mapping",
           ur.section_of("https://binaytara.org/journal/article/1-x") == "IJCCD")
 
+    # Two functions, two jobs. is_allowed() CANONICALISES a discovered link and
+    # therefore accepts a tracking parameter and strips it; url_ok() is the SOP
+    # Rule 6 gate and rejects one outright. Every emitted suggestion passes
+    # url_ok(), so no parameter can reach a writer. Both directions are asserted
+    # here because an earlier version left this distinction undocumented.
+    q = "https://binaytara.org/cancernews/foo?utm_source=x"
+    f = "https://binaytara.org/cancernews/foo#section"
+    check("is_allowed canonicalises a query string", ur.is_allowed(q))
+    check("is_allowed canonicalises a fragment", ur.is_allowed(f))
+    check("normalise strips the query",
+          ur.normalise(q) == "https://binaytara.org/cancernews/foo", ur.normalise(q))
+    check("normalise strips the fragment",
+          ur.normalise(f) == "https://binaytara.org/cancernews/foo", ur.normalise(f))
+    check("url_ok rejects the query string outright", not rules.url_ok(q))
+    check("url_ok rejects the fragment outright", not rules.url_ok(f))
+    check("url_ok accepts the canonicalised form", rules.url_ok(ur.normalise(q)))
+    check("url_ok rejects http", not rules.url_ok("http://binaytara.org/x"))
+    check("draft placeholder never shown as a URL",
+          "draft://" not in rules.display_url("draft://x.docx"))
+
 
 def test_r7():
     print("\nR7 body links versus navigation links")

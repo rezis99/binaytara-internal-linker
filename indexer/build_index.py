@@ -26,6 +26,12 @@ from indexer.extractor import extract
 ARTIFACTS = ["faiss.index", "pages.json", "paragraphs.json", "manifest.json",
              "anchor_guide.json", "bm25"]
 
+# Fail-closed thresholds. A stale index is recoverable; a silently truncated one
+# looks healthy and produces wrong suggestions for weeks.
+CRAWL_FAILURE_LIMIT = 0.10
+EXTRACTION_FAILURE_LIMIT = 0.25
+MIN_RETAINED_RATIO = 0.80
+
 
 def fetch_anchor_guide() -> dict:
     """Supplementary data source. A failure here must never fail the build."""
@@ -84,16 +90,18 @@ def build(limit: int | None = None, out_dir: Path | None = None,
     fetched, stats = crawler.crawl(urls)
     if not fetched:
         raise RuntimeError("no pages fetched; aborting")
-    if stats.failed > 0.10 * len(urls):
+    if stats.failed > CRAWL_FAILURE_LIMIT * len(urls):
         raise RuntimeError(
             f"{stats.failed}/{len(urls)} pages failed (>10%); aborting without committing"
         )
 
     print("3/6 extracting content")
     pages, all_chunks, redirects = {}, [], {}
+    extraction_failed, collisions = [], []
     for item in fetched:
         rec = extract(item["html"], item["final_url"])
         if rec is None:
+            extraction_failed.append(item["final_url"])
             continue
         target = rec.get("canonical_url") or rec["url"]
         if not ur.is_allowed(target):
@@ -106,6 +114,8 @@ def build(limit: int | None = None, out_dir: Path | None = None,
             n = ur.normalise(hop)
             if n and n != target:
                 redirects[n] = target
+        if target in pages:
+            collisions.append((item["final_url"], target))
         blocks = rec.pop("_blocks")
         page_chunks = chunker.chunk_page(target, blocks)
         if not page_chunks:
@@ -114,9 +124,42 @@ def build(limit: int | None = None, out_dir: Path | None = None,
                 page_chunks = [syn]
         all_chunks.extend(page_chunks)
         pages[target] = rec
-    print(f"  pages={len(pages)} chunks={len(all_chunks)} redirects={len(redirects)}")
+    target_only = sum(1 for r in pages.values() if not r.get("body_available"))
+    print(f"  pages={len(pages)} chunks={len(all_chunks)} redirects={len(redirects)} "
+          f"target_only={target_only} extraction_failed={len(extraction_failed)} "
+          f"canonical_collisions={len(collisions)}")
     if not all_chunks:
         raise RuntimeError("no eligible chunks produced; check the selectors")
+
+    # A template change can let every page fetch with HTTP 200 and still yield
+    # nothing usable. Crawl success alone does not prove the index is sound.
+    if len(extraction_failed) > EXTRACTION_FAILURE_LIMIT * len(fetched):
+        raise RuntimeError(
+            f"{len(extraction_failed)}/{len(fetched)} pages fetched but produced no "
+            f"usable record (>{EXTRACTION_FAILURE_LIMIT:.0%}). The site template has "
+            "probably changed; check config/selectors.py. Aborting without committing.\n"
+            f"  examples: {extraction_failed[:5]}"
+        )
+    if collisions:
+        print(f"  ! {len(collisions)} pages collapsed onto an existing canonical URL")
+        for src, tgt in collisions[:5]:
+            print(f"      {src} -> {tgt}")
+
+    # Guard against a silent shrink against the previous index.
+    prev_path = settings.DATA / "manifest.json"
+    if out_dir is None and prev_path.exists():
+        try:
+            prev = json.loads(prev_path.read_text("utf-8"))
+            prev_pages = int(prev.get("pages", 0))
+            if prev_pages and len(pages) < MIN_RETAINED_RATIO * prev_pages and not limit \
+                    and not per_section:
+                raise RuntimeError(
+                    f"Page count dropped from {prev_pages} to {len(pages)} "
+                    f"(<{MIN_RETAINED_RATIO:.0%} retained). Aborting without committing; "
+                    "run with --per-section to investigate."
+                )
+        except json.JSONDecodeError:
+            pass
 
     print("4/6 counting inbound links")
     inbound = defaultdict(int)
@@ -157,6 +200,10 @@ def build(limit: int | None = None, out_dir: Path | None = None,
         "pages": len(pages),
         "chunks": len(all_chunks),
         "orphan_pages": orphans,
+        "target_only_pages": target_only,
+        "extraction_failed": len(extraction_failed),
+        "canonical_collisions": [{"from": a, "to": b} for a, b in collisions],
+        "build_seconds": None,
         "redirects": redirects,
         "lastmod": {u: lastmod.get(pages[u].get("sitemap_url")) for u in pages},
         "content_hash": {u: r["content_hash"] for u, r in pages.items()},
@@ -178,6 +225,9 @@ def build(limit: int | None = None, out_dir: Path | None = None,
             shutil.move(str(src), str(dst))
         print(f"promoted artifacts into {settings.DATA}")
     took = (datetime.now(timezone.utc) - started).total_seconds()
+    manifest["build_seconds"] = round(took)
+    (settings.DATA if out_dir is None else tmp).joinpath("manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=1), "utf-8")
     print(f"done in {took:.0f}s")
     return manifest
 

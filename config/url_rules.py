@@ -59,14 +59,23 @@ def is_blocked_host(url: str) -> bool:
 
 
 def is_allowed(url: str) -> bool:
-    """True only for main-domain HTML pages that may be indexed or suggested."""
+    """CANONICALISING gate. True when the url, after normalisation, points at a
+    main-domain HTML page that belongs in the index.
+
+    This deliberately ACCEPTS input carrying a query string or fragment and
+    strips it, because discovered links on real pages carry tracking parameters
+    and a writer pasting a URL from analytics should not be rejected over
+    "?utm_source=". What enters the index is always the normalised form.
+
+    It is NOT the SOP Rule 6 gate. Nothing suggested to a writer passes through
+    this function alone: every emitted URL is checked by rules.url_ok(), which
+    REJECTS query strings and fragments outright. Keep the two separate; folding
+    them together would either break link discovery or leak parameters into
+    output.
+    """
     n = normalise(url)
     if not n:
         return False
-    if "?" in url or "#" in url:
-        # Query strings are forbidden on internal links (SOP Rule 6). We still
-        # allow the normalised form, so only reject if normalisation failed.
-        pass
     p = urlparse(n)
     if p.scheme != "https":
         return False

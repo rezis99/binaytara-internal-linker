@@ -61,14 +61,29 @@ def links_to_give(article: dict, store: retrieval.Store,
             if not named_ok:
                 continue
 
+            # Hard relevance gate BEFORE anchor work. A candidate below the
+            # measured noise floor is not a weak suggestion, it is noise, and no
+            # amount of anchor quality should rescue it.
+            if cand["raw_cosine"] < settings.COSINE_HARD_MIN:
+                continue
+
             best = anchor_mod.select(target, chunk["text"], store.guide)
             if not best or not rules.anchor_word_count_ok(best["anchor"]):   # R8
+                continue
+
+            # Asking a writer to rewrite a sentence is only worth it when the
+            # topical match is strong. This is what stops "incorporate the
+            # phrase 'Summer Volunteer Position' into this paragraph".
+            if best["match_type"] == "Needs insertion" \
+                    and cand["raw_cosine"] < settings.COSINE_INSERTION_MIN:
                 continue
 
             score = rules.final_score(
                 cand["semantic_score"], cand["lexical_score"], best["anchor_score"],
                 deorphan=deorphan, inbound=target.get("inbound_link_count", 0),
-                synthetic=not cand["chunk"].get("placement_ok", True))
+                synthetic=not cand["chunk"].get("placement_ok", True),
+                evidence=rules.keyword_evidence(
+                    best["tier"], best["match_type"], best["anchor"]))
 
             keep, conf_note, force_lower = rules.conference_ok(target, score)  # R11
             if not keep:
@@ -155,6 +170,8 @@ def links_to_receive(article: dict, store: retrieval.Store,
         chunk = cand["chunk"]
         if source is None or not _sections_filter(source, allowed_sections):
             continue
+        if cand["raw_cosine"] < settings.COSINE_HARD_MIN:
+            continue
         if not chunk.get("placement_ok", True):
             continue          # a hub page has no paragraph a link can go into
         if article.get("is_draft"):
@@ -168,9 +185,14 @@ def links_to_receive(article: dict, store: retrieval.Store,
         best = anchor_mod.select(article, chunk["text"], store.guide)
         if not best or not rules.anchor_word_count_ok(best["anchor"]):
             continue
+        if best["match_type"] == "Needs insertion" \
+                and cand["raw_cosine"] < settings.COSINE_INSERTION_MIN:
+            continue
 
-        score = rules.final_score(cand["semantic_score"], cand["lexical_score"],
-                                  best["anchor_score"])
+        score = rules.final_score(
+            cand["semantic_score"], cand["lexical_score"], best["anchor_score"],
+            evidence=rules.keyword_evidence(
+                best["tier"], best["match_type"], best["anchor"]))
         b = rules.band(score)
         if b is None:
             continue
