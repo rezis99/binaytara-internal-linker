@@ -119,7 +119,7 @@ def main():
                 help="Boosts pages that currently have few inbound internal links.")
         st.divider()
         st.caption(f"Pages indexed: {store.manifest.get('pages', 0):,}")
-        body_count = store.manifest.get("body_texts_stored", len(store.body_texts))
+        body_count = store.manifest.get("body_texts_stored", len(getattr(store, "body_texts", {})))
         st.caption(f"Body texts stored: {body_count:,}")
         st.caption(f"Database built: {store.manifest.get('built_at', '')[:10]}")
         version = store.manifest.get("version", 2)
