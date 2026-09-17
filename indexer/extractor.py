@@ -1,7 +1,7 @@
 """HTML to structured page record.
 
-Highest-risk module in the build. The body-container choice determines which
-links count as body links (R7) and which text is eligible for placement.
+v3 change: returns _body_text (the concatenated body prose) so the indexer can
+store it for the keyword scanner without a second crawl pass.
 """
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ def _link_text_ratio(el) -> float:
 
 
 def pick_body(soup: BeautifulSoup):
-    """First selector yielding enough prose and not dominated by links."""
     for css in sel.BODY_SELECTORS:
         for el in soup.select(css):
             clone = BeautifulSoup(str(el), "lxml")
@@ -62,7 +61,6 @@ def _collect_links(el, base: str) -> list[tuple[str, str]]:
 
 
 def _bold_cover(el, txt: str) -> float:
-    """Proportion of a block's text that is bold."""
     if not txt:
         return 0.0
     bold = " ".join(_text(b) for b in el.find_all(["strong", "b"]))
@@ -70,10 +68,6 @@ def _bold_cover(el, txt: str) -> float:
 
 
 def is_pseudo_heading(el, txt: str) -> bool:
-    """TCN article bodies use fully-bold short paragraphs as section headings
-    rather than real <h2> tags. Verified on live pages. Without treating these
-    as headings, Key Takeaways and References regions are never detected and
-    heading_context is always empty."""
     if el.name != "p":
         return False
     if len(txt.split()) > sel.PSEUDO_HEADING_MAX_WORDS:
@@ -84,7 +78,6 @@ def is_pseudo_heading(el, txt: str) -> bool:
 def blocks_from_body(body, base: str) -> list[Block]:
     blocks, idx = [], 0
     for el in body.find_all(sel.BLOCK_TAGS):
-        # Skip nested blocks (e.g. <p> inside <blockquote>) to avoid duplication.
         if el.find_parent(sel.BLOCK_TAGS) is not None:
             continue
         txt = _text(el)
@@ -110,7 +103,6 @@ def _find_abstract(soup) -> str:
             t = _text(el)
             if len(t) > 80:
                 return t
-    # Fallback: blocks following a heading that reads exactly "Abstract".
     for h in soup.find_all(["h1", "h2", "h3"]):
         if re.match(r"^\s*abstract\s*$", _text(h), re.I):
             parts, node = [], h.find_next_sibling()
@@ -125,7 +117,6 @@ def _find_abstract(soup) -> str:
 
 
 def _event_dates(html: str) -> dict | None:
-    """Pull Event startDate / endDate from JSON-LD."""
     try:
         soup = BeautifulSoup(html, "lxml")
         for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
@@ -157,8 +148,6 @@ BRAND_TOKENS = {"the cancer news", "binaytara", "ijccd", "binaytara foundation"}
 
 
 def strip_brand(title: str) -> str:
-    """Drop brand segments. Titles use the brand mid-string as well as at the
-    end ('X | Binaytara | Y'), so split on separators rather than replacing."""
     if not title:
         return ""
     parts = re.split(r"\s*[|\u2502]\s*", title)
@@ -168,8 +157,6 @@ def strip_brand(title: str) -> str:
 
 
 def person_name_variants(full_name: str) -> list[str]:
-    """Name forms R10 will match against. Surname-only entries are marked so the
-    rule engine can demand an adjacent title or credential."""
     full_name = re.sub(r"\s+", " ", (full_name or "").strip())
     full_name = re.sub(r",?\s*(MD|PhD|DO|MPH|RN|DNB|MBBS)\b\.?", "", full_name, flags=re.I).strip()
     if not full_name:
@@ -184,7 +171,11 @@ def person_name_variants(full_name: str) -> list[str]:
 
 
 def extract(html: str, final_url: str) -> dict | None:
-    """Return a page record, or None when the page has no usable body."""
+    """Return a page record, or None when the page has no usable body.
+
+    v3: includes _body_text (full body prose, not lowercased) so the indexer can
+    store it for the keyword scanner.
+    """
     soup = BeautifulSoup(html, "lxml")
 
     title = _text(soup.title) if soup.title else ""
@@ -198,10 +189,6 @@ def extract(html: str, final_url: str) -> dict | None:
 
     all_links = _collect_links(soup, final_url)
 
-    # A page with no prose body (a listing or hub page such as /journal or
-    # /cancernews/all-articles) is still a legitimate LINK TARGET even though no
-    # link can be placed inside it. It is kept as a target-only record with no
-    # placement blocks, rather than dropped from the index entirely.
     body = pick_body(soup)
     body_available = body is not None
     blocks = []
@@ -229,7 +216,6 @@ def extract(html: str, final_url: str) -> dict | None:
 
     body_text = " ".join(b.text for b in blocks)
     if not body_available:
-        # Fall back to whatever prose the page does have, for the target summary.
         main = soup.find("main") or soup.body
         body_text = _text(main)[:2000] if main else ""
     digest = hashlib.sha256(
@@ -259,6 +245,8 @@ def extract(html: str, final_url: str) -> dict | None:
         "person_names": names,
         "inbound_link_count": 0,
         "content_hash": digest,
+        # v3: full body text for keyword scanner storage
+        "_body_text": body_text,
         "_blocks": [
             {
                 "index": b.index, "kind": b.kind, "text": b.text,

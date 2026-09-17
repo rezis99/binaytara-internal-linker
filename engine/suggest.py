@@ -1,4 +1,15 @@
-"""Orchestrator: an article in, two tables out."""
+"""Orchestrator: an article in, two tables out.
+
+v3 changes
+----------
+1. Keyword scan: extract disease terms from the article, grep every indexed
+   page's body text, boost pages that mention the article's core terms.
+2. Same-topic detection: pairwise H1 Jaccard similarity surfaces articles about
+   the same disease that the embedding model misses.
+3. LLM rewriting: "Needs insertion" rows get a proposed rewrite instead of a
+   manual instruction, when an LLM provider is configured.
+4. Recalibrated thresholds: lower hard gate, wider bands, keyword weight.
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -8,7 +19,8 @@ import numpy as np
 from config import settings
 from config import url_rules as ur
 from engine import anchor as anchor_mod
-from engine import retrieval, rules
+from engine import keyword_scan, retrieval, rules
+from engine import llm_rewrite
 from indexer import chunker, embedder
 
 SECTIONS = ["TCN", "IJCCD", "Blog", "Conference", "Project", "Static", "Contributor"]
@@ -29,6 +41,10 @@ def _recommend_note(row: dict, page: dict, is_best: bool) -> str:
     crowd = rules.crowding_note(page)
     if crowd:
         bits.append(crowd)
+    if row.get("keyword_note"):
+        bits.append(row["keyword_note"])
+    if row.get("title_sim_note"):
+        bits.append(row["title_sim_note"])
     return ". ".join(b for b in bits if b)
 
 
@@ -41,7 +57,22 @@ def links_to_give(article: dict, store: retrieval.Store,
     already = set(article.get("body_internal_links") or [])
     exclude = {article["url"]}
 
+    # v3: pre-compute keyword scan and title similarity for all pages.
+    article_terms = keyword_scan.extract_terms(article)
+    kw_scores = keyword_scan.scan_pages(article_terms, store.body_texts, exclude | already)
+    title_sims = keyword_scan.title_similarity(article, store.pages, exclude | already)
+
+    # Collect all candidate URLs from three sources:
+    # 1. Embedding retrieval (per-chunk)
+    # 2. Keyword scan (page-level)
+    # 3. Title similarity (page-level)
+    # For 2 and 3, we need to pick chunks from those pages to place the link in.
+
     placeable = [c for c in article["chunks"] if c.get("placement_ok", True)]
+
+    # Track which pages we already evaluated from embedding retrieval.
+    evaluated_targets: set[str] = set()
+
     for chunk in placeable:
         cands = retrieval.search_chunks(
             store, chunker.embed_text(chunk), exclude_urls=exclude)
@@ -52,40 +83,47 @@ def links_to_give(article: dict, store: retrieval.Store,
             target = store.page(cand["url"])
             if target is None or not _sections_filter(target, allowed_sections):
                 continue
-            if not rules.url_ok(target["url"]):                    # R9
+            if not rules.url_ok(target["url"]):
                 continue
-            if rules.already_linked_in_body(article, target["url"]):   # R7
+            if rules.already_linked_in_body(article, target["url"]):
                 continue
 
-            named_ok, name_note = rules.contributor_named(target, chunk["text"])  # R10
+            evaluated_targets.add(target["url"])
+
+            named_ok, name_note = rules.contributor_named(target, chunk["text"])
             if not named_ok:
                 continue
 
-            # Hard relevance gate BEFORE anchor work. A candidate below the
-            # measured noise floor is not a weak suggestion, it is noise, and no
-            # amount of anchor quality should rescue it.
+            # v3: relaxed hard gate (was 0.70, now 0.55).
             if cand["raw_cosine"] < settings.COSINE_HARD_MIN:
-                continue
+                # But keyword scan or title similarity can rescue it.
+                kw = kw_scores.get(target["url"], 0.0)
+                ts = title_sims.get(target["url"], 0.0)
+                if kw < 0.20 and ts < settings.TITLE_SIMILARITY_MIN:
+                    continue
 
             best = anchor_mod.select(target, chunk["text"], store.guide)
-            if not best or not rules.anchor_word_count_ok(best["anchor"]):   # R8
+            if not best or not rules.anchor_word_count_ok(best["anchor"]):
                 continue
 
-            # Asking a writer to rewrite a sentence is only worth it when the
-            # topical match is strong. This is what stops "incorporate the
-            # phrase 'Summer Volunteer Position' into this paragraph".
             if best["match_type"] == "Needs insertion" \
                     and cand["raw_cosine"] < settings.COSINE_INSERTION_MIN:
-                continue
+                kw = kw_scores.get(target["url"], 0.0)
+                if kw < 0.25:
+                    continue
+
+            kw = kw_scores.get(target["url"], 0.0)
+            ts = title_sims.get(target["url"], 0.0)
 
             score = rules.final_score(
                 cand["semantic_score"], cand["lexical_score"], best["anchor_score"],
+                keyword_score=kw, title_sim=ts,
                 deorphan=deorphan, inbound=target.get("inbound_link_count", 0),
                 synthetic=not cand["chunk"].get("placement_ok", True),
                 evidence=rules.keyword_evidence(
                     best["tier"], best["match_type"], best["anchor"]))
 
-            keep, conf_note, force_lower = rules.conference_ok(target, score)  # R11
+            keep, conf_note, force_lower = rules.conference_ok(target, score)
             if not keep:
                 continue
 
@@ -96,12 +134,26 @@ def links_to_give(article: dict, store: retrieval.Store,
                 b = "Lower"
 
             level, why = rules.overlap(article, target, best["anchor"])
+
+            # v3: LLM rewrite for "Needs insertion" rows.
+            llm_text = None
+            if best["match_type"] == "Needs insertion":
+                llm_text, was_rewritten = llm_rewrite.rewrite(
+                    chunk["text"], best["anchor"],
+                    target.get("h1") or target.get("title_clean") or "",
+                    target["url"])
+                if not was_rewritten:
+                    llm_text = None
+
+            kw_note = f"Keyword match: {kw:.0%}" if kw >= 0.10 else ""
+            ts_note = f"Same-topic match: {ts:.0%}" if ts >= settings.TITLE_SIMILARITY_MIN else ""
+
             group.append({
                 "block_index": chunk["block_index"],
                 "existing_sentence": chunk["text"],
                 "modified_sentence": rules.modified_sentence(
                     chunk["text"], best["span"], best["anchor"],
-                    target["url"], best["match_type"]),
+                    target["url"], best["match_type"], llm_rewrite=llm_text),
                 "anchor": best["anchor"],
                 "target_url": target["url"],
                 "target_title": target.get("h1") or target.get("title_clean") or "",
@@ -112,6 +164,8 @@ def links_to_give(article: dict, store: retrieval.Store,
                 "overlap_why": why,
                 "score": score,
                 "extra_note": ". ".join(x for x in (name_note, conf_note) if x),
+                "keyword_note": kw_note,
+                "title_sim_note": ts_note,
                 "_page": target,
             })
 
@@ -120,7 +174,112 @@ def links_to_give(article: dict, store: retrieval.Store,
             r["notes"] = _recommend_note(r, r.pop("_page"), is_best=(i == 0))
         rows.extend(group)
 
-    rows = rules.enforce_caps(rows)                                # R5, R6
+    # v3: KEYWORD-SCAN RESCUE. Pages the keyword scanner or title similarity
+    # surfaced but embedding retrieval never evaluated get a second chance.
+    # Pick the best placeable chunk for each rescued page.
+    rescued_urls = (set(kw_scores.keys()) | set(title_sims.keys())) - evaluated_targets - already
+    if rescued_urls and placeable:
+        # Embed all placeable chunks once.
+        chunk_texts = [chunker.embed_text(c) for c in placeable]
+        chunk_vecs = embedder.embed_passages(chunk_texts)
+
+        for url in rescued_urls:
+            target = store.page(url)
+            if target is None or not _sections_filter(target, allowed_sections):
+                continue
+            if not rules.url_ok(target["url"]):
+                continue
+            if rules.already_linked_in_body(article, target["url"]):
+                continue
+
+            kw = kw_scores.get(url, 0.0)
+            ts = title_sims.get(url, 0.0)
+            if kw < 0.15 and ts < settings.TITLE_SIMILARITY_MIN:
+                continue
+
+            # Find the best chunk for this target by trying anchor matching.
+            best_row = None
+            for ci, chunk in enumerate(placeable):
+                named_ok, name_note = rules.contributor_named(target, chunk["text"])
+                if not named_ok:
+                    continue
+                best = anchor_mod.select(target, chunk["text"], store.guide)
+                if not best or not rules.anchor_word_count_ok(best["anchor"]):
+                    continue
+
+                # Compute a lightweight cosine score for this chunk-target pair.
+                t_parts = [target.get("h1") or "", target.get("title_clean") or "",
+                           target.get("meta_description") or ""]
+                t_text = ". ".join(p for p in t_parts if p)
+                if t_text:
+                    t_vec = embedder.embed_queries([t_text])
+                    raw_cos = float(chunk_vecs[ci] @ t_vec[0])
+                else:
+                    raw_cos = 0.0
+
+                sem = max(0.0, min(1.0, (raw_cos - settings.COSINE_NOISE_FLOOR)
+                                   / (settings.COSINE_SIGNAL_CEIL - settings.COSINE_NOISE_FLOOR)))
+
+                score = rules.final_score(
+                    sem, 0.0, best["anchor_score"],
+                    keyword_score=kw, title_sim=ts,
+                    deorphan=deorphan, inbound=target.get("inbound_link_count", 0),
+                    evidence=rules.keyword_evidence(
+                        best["tier"], best["match_type"], best["anchor"]))
+
+                b = rules.band(score)
+                if b is None:
+                    continue
+
+                if best_row is None or score > best_row["score"]:
+                    # LLM rewrite for needs-insertion.
+                    llm_text = None
+                    if best["match_type"] == "Needs insertion":
+                        llm_text, was_rewritten = llm_rewrite.rewrite(
+                            chunk["text"], best["anchor"],
+                            target.get("h1") or target.get("title_clean") or "",
+                            target["url"])
+                        if not was_rewritten:
+                            llm_text = None
+
+                    keep, conf_note, force_lower = rules.conference_ok(target, score)
+                    if not keep:
+                        continue
+                    if force_lower:
+                        b = "Lower"
+
+                    level, why = rules.overlap(article, target, best["anchor"])
+                    kw_note = f"Keyword match: {kw:.0%}" if kw >= 0.10 else ""
+                    ts_note = (f"Same-topic match: {ts:.0%}"
+                               if ts >= settings.TITLE_SIMILARITY_MIN else "")
+
+                    best_row = {
+                        "block_index": chunk["block_index"],
+                        "existing_sentence": chunk["text"],
+                        "modified_sentence": rules.modified_sentence(
+                            chunk["text"], best["span"], best["anchor"],
+                            target["url"], best["match_type"], llm_rewrite=llm_text),
+                        "anchor": best["anchor"],
+                        "target_url": target["url"],
+                        "target_title": target.get("h1") or target.get("title_clean") or "",
+                        "section": target.get("section", ""),
+                        "relevance": b,
+                        "match_type": best["match_type"],
+                        "overlap_level": level,
+                        "overlap_why": why,
+                        "score": score,
+                        "extra_note": ". ".join(x for x in (name_note, conf_note) if x),
+                        "keyword_note": kw_note,
+                        "title_sim_note": ts_note,
+                        "notes": "",
+                    }
+
+            if best_row:
+                best_row["notes"] = _recommend_note(
+                    best_row, target, is_best=False)
+                rows.append(best_row)
+
+    rows = rules.enforce_caps(rows)
     if not show_lower:
         rows = [r for r in rows if r["relevance"] in ("High", "Medium")]
     return rows
@@ -131,9 +290,7 @@ def links_to_receive(article: dict, store: retrieval.Store,
                      show_lower: bool = True) -> list[dict]:
     """Which existing pages should add a link pointing to this article.
 
-    The article is represented by its H1, its title, and its three most on-topic
-    chunks, fused with RRF. A plain mean of all chunk embeddings would pull a
-    multi-topic article toward a centroid representing none of its subjects.
+    v3: also searches via keyword scan and title similarity.
     """
     queries: list[str] = []
     if article.get("h1"):
@@ -151,6 +308,11 @@ def links_to_receive(article: dict, store: retrieval.Store,
     elif placeable:
         queries.extend(c["text"] for c in placeable[:3])
 
+    # v3: keyword scan and title similarity to find pages that should link here.
+    article_terms = keyword_scan.extract_terms(article)
+    kw_scores = keyword_scan.scan_pages(article_terms, store.body_texts, {article["url"]})
+    title_sims = keyword_scan.title_similarity(article, store.pages, {article["url"]})
+
     fused: dict[str, dict] = {}
     for q in queries:
         cands = retrieval.search_chunks(store, q, exclude_urls={article["url"]})
@@ -164,21 +326,46 @@ def links_to_receive(article: dict, store: retrieval.Store,
     cands = retrieval.collapse_to_pages(
         sorted(fused.values(), key=lambda c: -c["rrf"]), settings.RECEIVE_SOURCE_PAGES)
 
+    # v3: merge keyword-scan and title-sim pages that embedding missed.
+    cand_urls = {c["url"] for c in cands}
+    for url in (set(kw_scores.keys()) | set(title_sims.keys())) - cand_urls:
+        # Find the best chunk from this page.
+        chunk_ids = store.by_url.get(url, [])
+        if not chunk_ids:
+            continue
+        best_chunk = None
+        for ci in chunk_ids:
+            c = store.chunks[ci]
+            if c.get("placement_ok", True):
+                if best_chunk is None or ci < best_chunk["chunk_index"]:
+                    best_chunk = {
+                        "chunk_index": ci, "chunk": c, "url": url,
+                        "rrf": 0.0, "raw_cosine": 0.0,
+                        "semantic_score": 0.0, "raw_bm25": 0.0,
+                        "lexical_score": 0.0,
+                    }
+        if best_chunk:
+            cands.append(best_chunk)
+
     rows = []
     for cand in cands:
         source = store.page(cand["url"])
         chunk = cand["chunk"]
         if source is None or not _sections_filter(source, allowed_sections):
             continue
-        if cand["raw_cosine"] < settings.COSINE_HARD_MIN:
+        # v3: relaxed hard gate; keyword/title signals can rescue.
+        kw = kw_scores.get(cand["url"], 0.0)
+        ts = title_sims.get(cand["url"], 0.0)
+        if cand["raw_cosine"] < settings.COSINE_HARD_MIN and kw < 0.20 \
+                and ts < settings.TITLE_SIMILARITY_MIN:
             continue
         if not chunk.get("placement_ok", True):
-            continue          # a hub page has no paragraph a link can go into
+            continue
         if article.get("is_draft"):
             note_pub = ("Article not yet published; verify no existing link once "
                         "the URL is live")
         else:
-            if rules.already_linked_in_body(source, article["url"]):     # R7
+            if rules.already_linked_in_body(source, article["url"]):
                 continue
             note_pub = ""
 
@@ -186,18 +373,34 @@ def links_to_receive(article: dict, store: retrieval.Store,
         if not best or not rules.anchor_word_count_ok(best["anchor"]):
             continue
         if best["match_type"] == "Needs insertion" \
-                and cand["raw_cosine"] < settings.COSINE_INSERTION_MIN:
+                and cand["raw_cosine"] < settings.COSINE_INSERTION_MIN \
+                and kw < 0.25:
             continue
 
         score = rules.final_score(
             cand["semantic_score"], cand["lexical_score"], best["anchor_score"],
+            keyword_score=kw, title_sim=ts,
             evidence=rules.keyword_evidence(
                 best["tier"], best["match_type"], best["anchor"]))
         b = rules.band(score)
         if b is None:
             continue
         level, why = rules.overlap(source, article, best["anchor"])
-        notes = ". ".join(x for x in (note_pub, rules.crowding_note(source)) if x)
+
+        # LLM rewrite for receive-side needs-insertion.
+        llm_text = None
+        if best["match_type"] == "Needs insertion":
+            llm_text, was_rewritten = llm_rewrite.rewrite(
+                chunk["text"], best["anchor"],
+                article.get("h1") or article.get("title_clean") or "",
+                article["url"])
+            if not was_rewritten:
+                llm_text = None
+
+        kw_note = f"Keyword match: {kw:.0%}" if kw >= 0.10 else ""
+        ts_note = f"Same-topic: {ts:.0%}" if ts >= settings.TITLE_SIMILARITY_MIN else ""
+        notes = ". ".join(x for x in (note_pub, rules.crowding_note(source),
+                                       kw_note, ts_note) if x)
         rows.append({
             "source_url": source["url"],
             "source_title": source.get("h1") or source.get("title_clean") or "",
@@ -205,7 +408,7 @@ def links_to_receive(article: dict, store: retrieval.Store,
             "existing_sentence": chunk["text"],
             "modified_sentence": rules.modified_sentence(
                 chunk["text"], best["span"], best["anchor"],
-                article["url"], best["match_type"]),
+                article["url"], best["match_type"], llm_rewrite=llm_text),
             "anchor": best["anchor"],
             "relevance": b,
             "match_type": best["match_type"],
@@ -226,6 +429,9 @@ def analyse(article: dict, store: retrieval.Store,
             show_lower: bool = True, deorphan: bool = False) -> dict:
     give = links_to_give(article, store, allowed_sections, show_lower, deorphan)
     receive = links_to_receive(article, store, allowed_sections, show_lower)
+
+    llm_ok, llm_provider = llm_rewrite.is_available()
+
     return {
         "article": {
             "title": article.get("h1") or article.get("title_clean") or article["url"],
@@ -242,7 +448,9 @@ def analyse(article: dict, store: retrieval.Store,
         "index": {
             "built_at": store.manifest.get("built_at", ""),
             "pages": store.manifest.get("pages", 0),
+            "body_texts": store.manifest.get("body_texts_stored", 0),
             "age_days": round(retrieval.index_age_days(store), 1),
         },
+        "llm": {"available": llm_ok, "provider": llm_provider},
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }

@@ -1,7 +1,8 @@
-"""Unit tests for the SOP rule engine and the block classifier.
+"""Unit tests for the SOP rule engine, the block classifier, keyword scanner,
+and LLM rewrite validation.
 
-Every test here corresponds to a rule that, if broken, produces a suggestion a
-writer must not act on.
+v3 additions: keyword_scan tests, title_similarity tests, scoring with keyword
+weight, LLM validation tests.
 """
 import sys
 from datetime import date
@@ -11,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import url_rules as ur                              # noqa: E402
 from engine import anchor, cannibalization, conference, rules    # noqa: E402
+from engine import keyword_scan                                  # noqa: E402
+from engine import llm_rewrite                                   # noqa: E402
 from indexer.blocks import Block, classify                       # noqa: E402
 from indexer.extractor import person_name_variants, strip_brand  # noqa: E402
 from output import excel_writer                                  # noqa: E402
@@ -99,12 +102,6 @@ def test_urls():
     check("relative URL rejected by R9", not rules.url_ok("/cancernews/article/x"))
     check("section mapping",
           ur.section_of("https://binaytara.org/journal/article/1-x") == "IJCCD")
-
-    # Two functions, two jobs. is_allowed() CANONICALISES a discovered link and
-    # therefore accepts a tracking parameter and strips it; url_ok() is the SOP
-    # Rule 6 gate and rejects one outright. Every emitted suggestion passes
-    # url_ok(), so no parameter can reach a writer. Both directions are asserted
-    # here because an earlier version left this distinction undocumented.
     q = "https://binaytara.org/cancernews/foo?utm_source=x"
     f = "https://binaytara.org/cancernews/foo#section"
     check("is_allowed canonicalises a query string", ur.is_allowed(q))
@@ -140,21 +137,17 @@ def test_anchor():
     check("exact match found", got["match_type"] == "Exact in text", got)
     check("anchor within 2 to 5 words", rules.anchor_word_count_ok(got["anchor"]),
           got["anchor"])
-
     got = anchor.select(target, "Patients now receive very different regimens.", {})
     check("falls back to needs insertion", got["match_type"] == "Needs insertion")
-
     syn = {"url": "https://binaytara.org/x", "h1": "Renal Cell Carcinoma Treatment",
            "title_clean": "", "meta_description": ""}
     got = anchor.select(syn, "Options for kidney cancer treatment have expanded "
                              "considerably over the past decade of research.", {})
     check("synonym map bridges RCC to kidney cancer",
           got["match_type"] in ("Synonym in text", "Partial in text"), got["match_type"])
-
     guide = {"https://binaytara.org/x": {"approved_anchors": ["renal cell carcinoma treatment"]}}
     got = anchor.select(syn, "We reviewed renal cell carcinoma treatment options today.", guide)
     check("approved guide anchor wins", got["tier"] == 1, got)
-
     serp = {"url": "https://binaytara.org/y", "h1": "",
             "title_clean": "", "meta_description": "Learn the warning signs of cancer"}
     cands = [a for a, _t in anchor.candidates(serp, {})]
@@ -207,7 +200,7 @@ def test_conference():
     future = dict(past, event={"startDate": "2026-10-02", "endDate": "2026-10-03"})
     keep, _n, _f = rules.conference_ok(future, 0.95, today)
     check("upcoming event kept", keep)
-    keep, _n, force = rules.conference_ok(future, 0.65, today)
+    keep, _n, force = rules.conference_ok(future, 0.55, today)
     check("below conference minimum forced to Lower", keep and force)
     noschema = {"section": "Conference", "url": "https://binaytara.org/projects/conferences/7th-icc-2024",
                 "event": None, "h1": "7th ICC 2024", "title": "7th ICC 2024"}
@@ -232,10 +225,125 @@ def test_overlap():
           "cannibal" not in cannibalization.LABEL.lower())
 
 
+def test_keyword_scan():
+    print("\nKeyword scan (v3)")
+
+    # Term extraction.
+    article = {
+        "h1": "Alcohol and Stomach Cancer Risk",
+        "title_clean": "Alcohol and Stomach Cancer Risk",
+        "blocks": [
+            {"kind": "h2", "text": "Risk Factors"},
+            {"kind": "p", "text": "Heavy alcohol consumption is a major risk factor "
+                                   "for stomach cancer and esophageal cancer."},
+            {"kind": "p", "text": "Smoking combined with alcohol use increases the "
+                                   "risk of pancreatic cancer significantly."},
+        ],
+    }
+    terms = keyword_scan.extract_terms(article)
+    check("extracts H1 terms",
+          any("stomach" in t and "cancer" in t for t in terms) or
+          any("alcohol" in t for t in terms), terms[:10])
+    check("terms list is not empty", len(terms) > 0, terms)
+
+    # Body text scanning.
+    body_texts = {
+        "https://binaytara.org/cancernews/article/stomach-cancer-101":
+            "stomach cancer is a disease that affects the stomach lining. "
+            "alcohol consumption is a known risk factor for this condition.",
+        "https://binaytara.org/cancernews/article/kidney-cancer-awareness":
+            "kidney cancer affects hundreds of thousands of people worldwide. "
+            "early detection improves survival rates significantly.",
+        "https://binaytara.org/cancernews/article/esophageal-cancer-risks":
+            "esophageal cancer has several risk factors including alcohol "
+            "use and tobacco smoking over extended periods.",
+    }
+    scores = keyword_scan.scan_pages(terms, body_texts, set())
+    check("stomach cancer page found by keyword scan",
+          "https://binaytara.org/cancernews/article/stomach-cancer-101" in scores,
+          scores)
+    check("esophageal cancer page found",
+          "https://binaytara.org/cancernews/article/esophageal-cancer-risks" in scores,
+          scores)
+    # Kidney cancer page should score lower (doesn't mention alcohol or stomach).
+    stomach_score = scores.get("https://binaytara.org/cancernews/article/stomach-cancer-101", 0)
+    kidney_score = scores.get("https://binaytara.org/cancernews/article/kidney-cancer-awareness", 0)
+    check("stomach cancer scores higher than kidney cancer for alcohol article",
+          stomach_score > kidney_score,
+          f"stomach={stomach_score:.2f} kidney={kidney_score:.2f}")
+
+
+def test_title_similarity():
+    print("\nTitle similarity (v3)")
+    source = {"h1": "Stomach Cancer Symptoms and Risk Factors",
+              "title_clean": "Stomach Cancer Symptoms"}
+    pages = {
+        "https://binaytara.org/a": {"h1": "Stomach Cancer Treatment Options",
+                                     "title_clean": "Stomach Cancer Treatment"},
+        "https://binaytara.org/b": {"h1": "Kidney Cancer Awareness Month",
+                                     "title_clean": "Kidney Cancer Awareness"},
+        "https://binaytara.org/c": {"h1": "Gastric Cancer Early Detection",
+                                     "title_clean": "Gastric Cancer Detection"},
+    }
+    sims = keyword_scan.title_similarity(source, pages, set())
+    check("stomach cancer article found as same-topic",
+          "https://binaytara.org/a" in sims, sims)
+    check("kidney cancer NOT flagged as same-topic (different disease)",
+          "https://binaytara.org/b" not in sims, sims)
+
+
+def test_llm_validation():
+    print("\nLLM rewrite validation (v3)")
+    # Good rewrite: anchor appears verbatim.
+    check("valid rewrite accepted",
+          llm_rewrite._validate(
+              "Alcohol is a risk factor for many cancers.",
+              "Alcohol is a well-known risk factor for stomach cancer and many other cancers.",
+              "stomach cancer"))
+    # Bad rewrite: anchor missing.
+    check("rewrite without anchor rejected",
+          not llm_rewrite._validate(
+              "Alcohol is a risk factor.",
+              "Alcohol is a risk factor for many types of malignancies.",
+              "stomach cancer"))
+    # Bad rewrite: too long.
+    check("overlong rewrite rejected",
+          not llm_rewrite._validate(
+              "Short.",
+              "This is an extremely long rewrite " * 20,
+              "stomach cancer"))
+    # Bad rewrite: contains markdown.
+    check("rewrite with markdown rejected",
+          not llm_rewrite._validate(
+              "Alcohol is a risk factor.",
+              "Alcohol is a risk factor for [stomach cancer](url).",
+              "stomach cancer"))
+
+
+def test_scoring_v3():
+    print("\nv3 scoring with keyword weight")
+    # A page with a keyword hit should score higher than one without.
+    s_no_kw = rules.final_score(0.3, 0.2, 0.9, keyword_score=0.0)
+    s_with_kw = rules.final_score(0.3, 0.2, 0.9, keyword_score=0.5)
+    check("keyword score boosts total", s_with_kw > s_no_kw,
+          f"kw={s_with_kw:.3f} no_kw={s_no_kw:.3f}")
+
+    # Keyword hit floor: a strong keyword hit rescues a weak embedding score.
+    s_rescued = rules.final_score(0.1, 0.1, 0.9, keyword_score=0.4)
+    check("keyword hit floor rescues weak embedding",
+          s_rescued >= 0.40, f"score={s_rescued:.3f}")
+
+    # Title similarity floor.
+    from config import settings
+    s_title = rules.final_score(0.1, 0.1, 0.9, title_sim=0.50)
+    check("title similarity floor applied",
+          s_title >= settings.TITLE_SIMILARITY_FLOOR * 0.9, f"score={s_title:.3f}")
+
+
 def test_misc():
     print("\nScoring, Excel escaping, brand stripping")
-    check("band High", rules.band(0.70) == "High")
-    check("band Medium", rules.band(0.50) == "Medium")
+    check("band High", rules.band(0.60) == "High")
+    check("band Medium", rules.band(0.42) == "Medium")
     check("band below floor dropped", rules.band(0.10) is None)
     check("benchmark short", rules.benchmark(300) == "2 to 4")
     check("benchmark long", rules.benchmark(1800) == "8 to 12")
@@ -263,11 +371,17 @@ def test_misc():
     check("needs insertion gives an instruction",
           "incorporate" in rules.modified_sentence(
               "a b", None, "kidney cancer", "https://x", "Needs insertion"))
+    check("needs insertion with LLM rewrite uses the rewrite",
+          "already rewritten" in rules.modified_sentence(
+              "a b", None, "kidney cancer", "https://x", "Needs insertion",
+              llm_rewrite="already rewritten with [kidney cancer](https://x)"))
 
 
 if __name__ == "__main__":
     for fn in (test_blocks, test_urls, test_r7, test_anchor, test_caps,
-               test_contributor, test_conference, test_overlap, test_misc):
+               test_contributor, test_conference, test_overlap,
+               test_keyword_scan, test_title_similarity, test_llm_validation,
+               test_scoring_v3, test_misc):
         fn()
     print("\n" + "=" * 60)
     if FAILURES:

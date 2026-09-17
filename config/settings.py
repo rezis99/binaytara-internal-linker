@@ -10,10 +10,6 @@ SITEMAP_URL = f"{SITE}/sitemap.xml"
 ALLOWED_HOST = "binaytara.org"
 
 # ---------- Embedding contract ----------
-# Verified empirically on fastembed 0.4.2: query_embed() does NOT apply the BGE
-# instruction prefix (it returns vectors identical to embed()). The application
-# must therefore add it itself. Vectors come back L2-normalised, so FAISS inner
-# product equals cosine similarity.
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBED_DIM = 384
 QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
@@ -26,10 +22,10 @@ REQUEST_TIMEOUT = 20.0
 MAX_RETRIES = 3
 MAX_REDIRECTS = 5
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
-USER_AGENT = "BinaytaraInternalLinker/1.0 (SEO tooling; contact rejish.s@binaytara.org)"
+USER_AGENT = "BinaytaraInternalLinker/3.0 (SEO tooling; contact rejish.s@binaytara.org)"
 
 # ---------- Chunking ----------
-MIN_BLOCK_WORDS = 20        # below this a block is a caption or one-liner, not prose
+MIN_BLOCK_WORDS = 20
 MAX_CHUNK_WORDS = 120
 MIN_BODY_CHARS = 500
 MAX_LINK_TEXT_RATIO = 0.5
@@ -42,31 +38,31 @@ CANDIDATES_PER_CHUNK = 10
 RECEIVE_SOURCE_PAGES = 15
 
 # ---------- Scoring ----------
-# MEASURED, not assumed. Cosine similarity between 778 pairs of UNRELATED chunks
-# from this corpus (bge-small-en-v1.5): p1 0.399, p25 0.508, median 0.563,
-# p95 0.670, p99 0.719. BGE similarities live in a narrow high band, so the
-# naive (cos + 1) / 2 mapping gave two unrelated paragraphs a semantic score of
-# 0.78 and pushed almost every candidate into the Medium band. Rescale against
-# the observed noise floor instead: everything at or below the unrelated p95
-# scores zero, and only genuinely close matches earn signal.
-COSINE_NOISE_FLOOR = 0.70     # just above unrelated p99 (0.719 measured)
-COSINE_SIGNAL_CEIL = 0.82     # measured: genuinely good matches top out near here
+# v3 RECALIBRATION. v2 measured unrelated p95 at cosine 0.670 and set the hard
+# gate at 0.70, which was above p99 (0.719). That killed recall on the full
+# 1,680-page index: the same article went from 26 suggestions (v1, too many) to
+# 2 (v2, too few). The v3 audit target is 8 to 15 suggestions per article with
+# 60%+ precision.
+#
+# The floor is lowered to p75 of the unrelated distribution. Genuine matches
+# still separate clearly above 0.72, but near-misses that keyword evidence or
+# title similarity can rescue are no longer silently dropped.
+COSINE_NOISE_FLOOR = 0.60
+COSINE_SIGNAL_CEIL = 0.82
 
-# Hard gate applied before scoring. A candidate below this is not a weak
-# suggestion, it is noise, and no anchor quality should rescue it.
-COSINE_HARD_MIN = 0.70
+# Hard gate: below this, a candidate is noise regardless of keyword evidence.
+COSINE_HARD_MIN = 0.55
 
-# "Needs insertion" asks the writer to rewrite a sentence. That is only worth
-# their time when the topical match is strong, so it carries a higher bar.
-COSINE_INSERTION_MIN = 0.80
+# "Needs insertion" still needs stronger evidence than "Exact in text".
+COSINE_INSERTION_MIN = 0.68
 
-W_SEMANTIC = 0.55
-W_LEXICAL = 0.25
-W_ANCHOR = 0.20
+W_SEMANTIC = 0.45
+W_LEXICAL = 0.20
+W_ANCHOR = 0.15
+W_KEYWORD = 0.20        # NEW: weight for the keyword-scan signal
 
 ANCHOR_TIER_SCORE = {1: 1.00, 2: 0.90, 3: 0.75, 4: 0.60, 5: 0.35}
 
-# PRIMARY CALIBRATION PARAMETER. Sweep 0.55 to 0.85 against the golden set.
 MATCH_MULTIPLIER = {
     "Exact in text": 1.00,
     "Synonym in text": 0.95,
@@ -74,30 +70,15 @@ MATCH_MULTIPLIER = {
     "Needs insertion": 0.60,
 }
 
-# Anchor quality measures how good the ANCHOR is, not how relevant the TARGET
-# is, so it scales the relevance score rather than adding to it: it can only
-# discount a match, never rescue an irrelevant one.
-#
-# But an exact match on a SPECIFIC multi-word phrase taken from the target's own
-# H1 is not merely good anchor text, it is independent evidence that the two
-# pages share a topic. "breast cancer" appearing verbatim in a paragraph about
-# breast cancer risk, pointing at a page whose H1 is about breast cancer, is a
-# good link whatever the embedding says. Embeddings compress hard on
-# domain-specific corpora, so this lexical evidence is treated as a floor on
-# relevance rather than being discarded.
-KEYWORD_EVIDENCE_FLOOR = 0.62      # applies to Tier 1 and 2 exact/synonym matches
+KEYWORD_EVIDENCE_FLOOR = 0.62
 KEYWORD_EVIDENCE_MIN_WORDS = 2
 
-# A hub or listing page is represented by ONE synthetic chunk built from its H1,
-# title and meta description. That text is short and keyword-dense, which gives
-# it an unfair advantage in both dense and lexical retrieval against real
-# paragraphs. Penalise it so a real article beats a hub page at equal relevance.
 SYNTHETIC_PENALTY = 0.80
 
-BAND_HIGH = 0.62
-BAND_MEDIUM = 0.45
-BAND_MIN = 0.30
-CONFERENCE_MIN_SCORE = 0.70
+BAND_HIGH = 0.55
+BAND_MEDIUM = 0.38
+BAND_MIN = 0.22
+CONFERENCE_MIN_SCORE = 0.60
 
 # ---------- SOP rules ----------
 MAX_PER_PARAGRAPH = 2
@@ -111,12 +92,34 @@ LINK_BENCHMARK = [(500, "2 to 4"), (1000, "4 to 8"), (10 ** 9, "8 to 12")]
 OVERLAP_HIGH = 0.60
 OVERLAP_MEDIUM = 0.35
 
+# ---------- Keyword scan (v3) ----------
+# Minimum term length and occurrence thresholds for the keyword scanner.
+KEYWORD_MIN_TERM_LEN = 4          # ignore very short terms
+KEYWORD_MAX_TERMS = 30            # cap extracted terms per article
+# A page-level keyword hit on a core disease term is strong independent evidence.
+# It sets a floor under the combined score, rescuing candidates the embedding
+# missed (the "alcohol" <> "stomach cancer" failure from the v2 audit).
+KEYWORD_HIT_FLOOR = 0.50
+# Title similarity threshold for same-topic detection. Two articles whose H1s
+# share more than this fraction of content words are considered same-topic and
+# always surface as candidates.
+TITLE_SIMILARITY_MIN = 0.40
+TITLE_SIMILARITY_FLOOR = 0.58     # score floor for same-topic matches
+
+# ---------- LLM rewriting (v3) ----------
+LLM_ENABLED = True
+LLM_PROVIDER = "groq"             # "groq" | "huggingface" | "none"
+LLM_MODEL_GROQ = "llama-3.1-8b-instant"
+LLM_MODEL_HF = "mistralai/Mistral-7B-Instruct-v0.3"
+LLM_TIMEOUT = 15.0
+LLM_MAX_RETRIES = 2
+
 # ---------- De-orphaning ----------
 DEORPHAN_BONUS = 0.10
 DEORPHAN_CAP = 10
 
 # ---------- App ----------
-BATCH_WORKERS = 1          # raised only after the production memory test passes
+BATCH_WORKERS = 1
 BATCH_MAX = 20
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 INDEX_STALE_DAYS = 10

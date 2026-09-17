@@ -1,9 +1,4 @@
-"""End-to-end integration tests.
-
-test_rules.py proves the deterministic rule functions behave. It does NOT prove
-the shipped index loads, that a real article flows through the pipeline, or that
-the workbook opens. This file does, using the artifacts in data/ and fixtures
-built in memory. No network access is required.
+"""End-to-end integration tests (v3).
 
 Run: python tests/test_end_to_end.py
 """
@@ -88,6 +83,7 @@ def make_docx() -> bytes:
 def article_from_html() -> dict:
     rec = extract(ARTICLE_HTML, FIXTURE_URL)
     blocks = rec.pop("_blocks")
+    rec.pop("_body_text", None)
     from indexer.chunker import chunk_page
     rec["chunks"] = chunk_page(rec["url"], blocks)
     rec["blocks"] = blocks
@@ -115,6 +111,10 @@ def test_artifacts():
           all(rules.url_ok(u) for u in list(store.pages)[:200]))
     check("no subdomain leaked into the index",
           not any(".binaytara.org" in u or "binayfoundation" in u for u in store.pages))
+    # v3: body texts loaded.
+    check("body texts loaded", len(store.body_texts) > 0 or
+          not (settings.DATA / "body_texts.json").exists(),
+          f"body_texts={len(store.body_texts)}")
     return store
 
 
@@ -162,6 +162,8 @@ def test_html_pipeline(store):
     check("suggestions never land in a skipped block",
           all(any(b["index"] == r["block_index"] and b["eligible"]
                   for b in art["blocks"]) for r in res["give"]))
+    # v3: check LLM metadata is present.
+    check("analyse result includes LLM status", "llm" in res, list(res.keys()))
     return res
 
 
@@ -173,7 +175,6 @@ def test_docx_pipeline(store):
     check("references skipped in draft", "REFERENCES" in reasons, reasons)
     check("quote skipped in draft", "QUOTE" in reasons, reasons)
     check("draft flagged as draft", art["is_draft"])
-
     res = suggest.analyse(art, store)
     leaked = [r for r in res["give"] + res["receive"]
               if rules.DRAFT_SCHEME in r["modified_sentence"]]
@@ -199,7 +200,6 @@ def test_workbook(results):
           wb.sheetnames)
     check("all sheet names within Excel's 31-char limit",
           all(len(n) <= 31 for n in wb.sheetnames))
-
     formula_cells = []
     for ws in wb.worksheets:
         for row in ws.iter_rows():
@@ -207,7 +207,6 @@ def test_workbook(results):
                 if isinstance(cell.value, str) and cell.value[:1] in ("=", "+", "@"):
                     formula_cells.append((ws.title, cell.coordinate, cell.value[:20]))
     check("no unescaped formula cells", not formula_cells, formula_cells[:2])
-
     give = next(ws for ws in wb.worksheets if ws.title.startswith("Give"))
     headers = [c.value for c in give[1]]
     check("Give headers use the heuristic label",
@@ -230,13 +229,11 @@ def test_input_guards():
             check(why, False, "was accepted")
         except input_parser.InputError:
             check(why, True)
-
     try:
         input_parser.from_docx(b"not a zip file at all", "x.docx")
         check("non-docx upload rejected", False)
     except input_parser.InputError:
         check("non-docx upload rejected", True)
-
     try:
         input_parser.from_docx(b"PK" + b"0" * (settings.MAX_UPLOAD_BYTES + 10), "x.docx")
         check("oversized upload rejected", False)
@@ -244,8 +241,20 @@ def test_input_guards():
         check("oversized upload rejected", True)
 
 
+def test_canonical_fix():
+    """v3: verify the extractor returns _body_text for keyword scanner storage."""
+    print("\nCanonical collision fix (v3)")
+    rec = extract(ARTICLE_HTML, FIXTURE_URL)
+    check("extractor returns _body_text", "_body_text" in rec, list(rec.keys()))
+    check("_body_text is non-empty", len(rec.get("_body_text", "")) > 50,
+          len(rec.get("_body_text", "")))
+    check("canonical_url is captured",
+          rec.get("canonical_url") == FIXTURE_URL, rec.get("canonical_url"))
+
+
 if __name__ == "__main__":
     test_input_guards()
+    test_canonical_fix()
     store = test_artifacts()
     if store is not None:
         html_res = test_html_pipeline(store)

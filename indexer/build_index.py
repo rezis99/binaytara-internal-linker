@@ -1,5 +1,18 @@
 """Full index build. Writes to a temp directory and only promotes artifacts into
-data/ when every step succeeds, so a partial index is never committed."""
+data/ when every step succeeds, so a partial index is never committed.
+
+v3 changes
+----------
+1. CANONICAL COLLISION FIX. Pages are always indexed under their actual (final)
+   URL, never under a canonical that points elsewhere. A page whose canonical
+   differs from its own URL is logged as a mismatch for SEO review, but its data
+   is never overwritten by a different page. This eliminates the ghost-data bug
+   that caused URL/title mismatches in 5 of 6 audit files.
+
+2. BODY TEXT STORAGE. Each page's lowercased body text is written to
+   body_texts.json so the keyword scanner can grep it at query time without
+   re-crawling. Adds ~8 MB to the index for 1,680 pages.
+"""
 from __future__ import annotations
 
 import argparse
@@ -24,10 +37,8 @@ from indexer import chunker, crawler, embedder, sitemap
 from indexer.extractor import extract
 
 ARTIFACTS = ["faiss.index", "pages.json", "paragraphs.json", "manifest.json",
-             "anchor_guide.json", "bm25"]
+             "anchor_guide.json", "body_texts.json", "bm25"]
 
-# Fail-closed thresholds. A stale index is recoverable; a silently truncated one
-# looks healthy and produces wrong suggestions for weeks.
 CRAWL_FAILURE_LIMIT = 0.10
 EXTRACTION_FAILURE_LIMIT = 0.25
 MIN_RETAINED_RATIO = 0.80
@@ -70,11 +81,9 @@ def build(limit: int | None = None, out_dir: Path | None = None,
     tmp = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="bil-index-"))
     tmp.mkdir(parents=True, exist_ok=True)
 
-    print("1/6 discovering URLs from sitemap")
+    print("1/7 discovering URLs from sitemap")
     records = sitemap.discover()
     if per_section:
-        # Stratified sample so a smoke-test index still contains real articles
-        # from every section, not just the alphabetically-first static pages.
         buckets: dict[str, list] = {}
         for r in records:
             buckets.setdefault(ur.section_of(r["sitemap_url"]), []).append(r)
@@ -86,7 +95,7 @@ def build(limit: int | None = None, out_dir: Path | None = None,
     lastmod = {ur.normalise(r["sitemap_url"]): r.get("lastmod") for r in records}
     urls = [ur.normalise(r["sitemap_url"]) for r in records]
 
-    print(f"2/6 crawling {len(urls)} pages")
+    print(f"2/7 crawling {len(urls)} pages")
     fetched, stats = crawler.crawl(urls)
     if not fetched:
         raise RuntimeError("no pages fetched; aborting")
@@ -95,27 +104,60 @@ def build(limit: int | None = None, out_dir: Path | None = None,
             f"{stats.failed}/{len(urls)} pages failed (>10%); aborting without committing"
         )
 
-    print("3/6 extracting content")
+    print("3/7 extracting content")
     pages, all_chunks, redirects = {}, [], {}
-    extraction_failed, collisions = [], []
+    body_texts: dict[str, str] = {}
+    extraction_failed = []
+    canonical_mismatches = []
+    canonical_collisions = []
+
     for item in fetched:
         rec = extract(item["html"], item["final_url"])
         if rec is None:
             extraction_failed.append(item["final_url"])
             continue
-        target = rec.get("canonical_url") or rec["url"]
-        if not ur.is_allowed(target):
-            target = rec["url"]
+
+        actual_url = rec["url"]       # final URL after redirect following
+        canonical = rec.get("canonical_url")
+
+        # --- v3 CANONICAL COLLISION FIX ---
+        # Always index under the actual URL. A canonical that points elsewhere
+        # is logged but never followed, because following it caused Page A's
+        # data to overwrite Page B's data when both had broken canonicals
+        # pointing at B. This was the root cause of the URL/title mismatches
+        # found in 5 of 6 audit files.
+        target = actual_url
+
+        if canonical and canonical != actual_url:
+            if ur.is_allowed(canonical):
+                canonical_mismatches.append({
+                    "page": actual_url,
+                    "canonical_points_to": canonical,
+                    "action": "indexed under actual URL; canonical ignored"
+                })
+            # If the canonical points to a URL already in the index, that is
+            # a collision we previously would have caused. Log it explicitly.
+            if canonical in pages:
+                canonical_collisions.append({
+                    "page": actual_url,
+                    "would_have_overwritten": canonical,
+                })
+
         rec["url"] = target
         rec["sitemap_url"] = item["sitemap_url"]
         rec["redirect_chain"] = item["redirect_chain"]
         rec["lastmod"] = lastmod.get(item["sitemap_url"])
+
         for hop in item["redirect_chain"]:
             n = ur.normalise(hop)
             if n and n != target:
                 redirects[n] = target
-        if target in pages:
-            collisions.append((item["final_url"], target))
+
+        # Store body text for the keyword scanner (v3).
+        raw_body = rec.pop("_body_text", "")
+        if raw_body:
+            body_texts[target] = raw_body.lower()
+
         blocks = rec.pop("_blocks")
         page_chunks = chunker.chunk_page(target, blocks)
         if not page_chunks:
@@ -123,16 +165,24 @@ def build(limit: int | None = None, out_dir: Path | None = None,
             if syn:
                 page_chunks = [syn]
         all_chunks.extend(page_chunks)
+
+        # True collision: two different actual URLs after redirect resolution.
+        if target in pages:
+            canonical_collisions.append({
+                "page": item["final_url"],
+                "collides_with": target,
+                "action": "later fetch overwrites"
+            })
         pages[target] = rec
+
     target_only = sum(1 for r in pages.values() if not r.get("body_available"))
     print(f"  pages={len(pages)} chunks={len(all_chunks)} redirects={len(redirects)} "
           f"target_only={target_only} extraction_failed={len(extraction_failed)} "
-          f"canonical_collisions={len(collisions)}")
+          f"canonical_mismatches={len(canonical_mismatches)} "
+          f"canonical_collisions={len(canonical_collisions)}")
     if not all_chunks:
         raise RuntimeError("no eligible chunks produced; check the selectors")
 
-    # A template change can let every page fetch with HTTP 200 and still yield
-    # nothing usable. Crawl success alone does not prove the index is sound.
     if len(extraction_failed) > EXTRACTION_FAILURE_LIMIT * len(fetched):
         raise RuntimeError(
             f"{len(extraction_failed)}/{len(fetched)} pages fetched but produced no "
@@ -140,12 +190,15 @@ def build(limit: int | None = None, out_dir: Path | None = None,
             "probably changed; check config/selectors.py. Aborting without committing.\n"
             f"  examples: {extraction_failed[:5]}"
         )
-    if collisions:
-        print(f"  ! {len(collisions)} pages collapsed onto an existing canonical URL")
-        for src, tgt in collisions[:5]:
-            print(f"      {src} -> {tgt}")
+    if canonical_mismatches:
+        print(f"  ! {len(canonical_mismatches)} pages have a canonical pointing elsewhere "
+              "(indexed under their own URL)")
+        for m in canonical_mismatches[:5]:
+            print(f"      {m['page']} -> canonical says {m['canonical_points_to']}")
+    if canonical_collisions:
+        print(f"  ! {len(canonical_collisions)} canonical collisions detected and prevented")
 
-    # Guard against a silent shrink against the previous index.
+    # Guard against a silent shrink.
     prev_path = settings.DATA / "manifest.json"
     if out_dir is None and prev_path.exists():
         try:
@@ -161,7 +214,7 @@ def build(limit: int | None = None, out_dir: Path | None = None,
         except json.JSONDecodeError:
             pass
 
-    print("4/6 counting inbound links")
+    print("4/7 counting inbound links")
     inbound = defaultdict(int)
     for rec in pages.values():
         for tgt in set(rec["body_internal_links"]):
@@ -173,7 +226,7 @@ def build(limit: int | None = None, out_dir: Path | None = None,
     orphans = sum(1 for r in pages.values() if r["inbound_link_count"] == 0)
     print(f"  pages with zero inbound body links: {orphans}/{len(pages)}")
 
-    print("5/6 embedding")
+    print("5/7 embedding")
     texts = [chunker.embed_text(c) for c in all_chunks]
     mat = embedder.embed_passages(texts)
     embedder.assert_normalised(mat)
@@ -181,7 +234,7 @@ def build(limit: int | None = None, out_dir: Path | None = None,
     index.add(mat)
     faiss.write_index(index, str(tmp / "faiss.index"))
 
-    print("6/6 building lexical index and writing artifacts")
+    print("6/7 building lexical index and writing artifacts")
     corpus_tokens = bm25s.tokenize(texts, stopwords="en", show_progress=False)
     retriever = bm25s.BM25()
     retriever.index(corpus_tokens, show_progress=False)
@@ -189,7 +242,9 @@ def build(limit: int | None = None, out_dir: Path | None = None,
 
     guide = fetch_anchor_guide()
 
+    print("7/7 writing body texts and manifest")
     manifest = {
+        "version": 3,
         "embedding_runtime": "fastembed",
         "model_name": settings.MODEL_NAME,
         "embedding_dimension": settings.EMBED_DIM,
@@ -199,10 +254,15 @@ def build(limit: int | None = None, out_dir: Path | None = None,
         "built_at": started.isoformat(),
         "pages": len(pages),
         "chunks": len(all_chunks),
+        "body_texts_stored": len(body_texts),
         "orphan_pages": orphans,
         "target_only_pages": target_only,
         "extraction_failed": len(extraction_failed),
-        "canonical_collisions": [{"from": a, "to": b} for a, b in collisions],
+        "canonical_mismatches": canonical_mismatches[:20],
+        "canonical_collisions": [
+            {"from": c.get("page", ""), "detail": c}
+            for c in canonical_collisions[:20]
+        ],
         "build_seconds": None,
         "redirects": redirects,
         "lastmod": {u: lastmod.get(pages[u].get("sitemap_url")) for u in pages},
@@ -211,6 +271,7 @@ def build(limit: int | None = None, out_dir: Path | None = None,
 
     (tmp / "pages.json").write_text(json.dumps(pages, ensure_ascii=False), "utf-8")
     (tmp / "paragraphs.json").write_text(json.dumps(all_chunks, ensure_ascii=False), "utf-8")
+    (tmp / "body_texts.json").write_text(json.dumps(body_texts, ensure_ascii=False), "utf-8")
     (tmp / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1), "utf-8")
     (tmp / "anchor_guide.json").write_text(json.dumps(guide, ensure_ascii=False), "utf-8")
 

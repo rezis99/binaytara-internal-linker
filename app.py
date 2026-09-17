@@ -1,10 +1,10 @@
-"""Binaytara Internal Link Recommender: Streamlit front end."""
+"""Binaytara Internal Link Recommender: Streamlit front end (v3)."""
 from __future__ import annotations
 
 import streamlit as st
 
 from config import settings
-from engine import input_parser, retrieval, suggest
+from engine import input_parser, llm_rewrite, retrieval, suggest
 from output import excel_writer
 
 st.set_page_config(page_title="Binaytara Internal Link Recommender",
@@ -119,7 +119,16 @@ def main():
                 help="Boosts pages that currently have few inbound internal links.")
         st.divider()
         st.caption(f"Pages indexed: {store.manifest.get('pages', 0):,}")
+        body_count = store.manifest.get("body_texts_stored", len(store.body_texts))
+        st.caption(f"Body texts stored: {body_count:,}")
         st.caption(f"Database built: {store.manifest.get('built_at', '')[:10]}")
+        version = store.manifest.get("version", 2)
+        st.caption(f"Index version: {version}")
+        llm_ok, llm_provider = llm_rewrite.is_available()
+        if llm_ok:
+            st.caption(f"✅ LLM rewriting: {llm_provider}")
+        else:
+            st.caption(f"⚠️ LLM rewriting: {llm_provider}")
         if age > settings.INDEX_STALE_DAYS:
             st.warning(f"The page database is {age:.0f} days old. "
                        "Recent articles may be missing.")
@@ -152,7 +161,7 @@ def main():
                         st.error(str(exc))
 
         if article is not None:
-            with st.spinner("Scoring suggestions..."):
+            with st.spinner("Scoring suggestions (keyword scan + embeddings + LLM)..."):
                 res = suggest.analyse(article, store, sections, show_lower, deorphan)
             st.session_state["results"] = [res]
 

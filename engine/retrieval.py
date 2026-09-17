@@ -1,9 +1,7 @@
 """Hybrid retrieval: dense (FAISS) plus lexical (BM25S), fused with Reciprocal
 Rank Fusion.
 
-RRF is used for CANDIDATE GENERATION because it needs no score normalisation
-between two incomparable scales. Ranking of the survivors is a separate step in
-scoring.py and does use a weighted sum, over explicitly normalised inputs.
+v3 change: Store now loads body_texts.json for the keyword scanner.
 """
 from __future__ import annotations
 
@@ -28,6 +26,7 @@ class Store:
     guide: dict
     index: object
     bm25: object
+    body_texts: dict = field(default_factory=dict)    # v3: url -> lowercased body text
     by_url: dict = field(default_factory=dict)
 
     def page(self, url: str) -> dict | None:
@@ -44,8 +43,13 @@ def load(data_dir=None) -> Store:
     except FileNotFoundError:
         guide = {}
 
-    # Refuse to serve an index built with a different embedding contract rather
-    # than returning silently wrong similarity scores.
+    # v3: load body texts for keyword scanner. Graceful fallback if missing
+    # (e.g. v2 index without body_texts.json).
+    try:
+        body_texts = json.loads((d / "body_texts.json").read_text("utf-8"))
+    except FileNotFoundError:
+        body_texts = {}
+
     if manifest.get("model_name") != settings.MODEL_NAME:
         raise RuntimeError(
             f"Index was built with {manifest.get('model_name')} but settings "
@@ -55,9 +59,6 @@ def load(data_dir=None) -> Store:
         raise RuntimeError("Index dimension does not match settings.EMBED_DIM.")
 
     index = faiss.read_index(str(d / "faiss.index"))
-    # A vector count that disagrees with the chunk list means every retrieved id
-    # points at the wrong paragraph. That produces confident, plausible, totally
-    # wrong suggestions, which is worse than an outage. Fail closed.
     if index.ntotal != len(chunks):
         raise RuntimeError(
             f"Index corrupt: FAISS holds {index.ntotal} vectors but "
@@ -68,13 +69,13 @@ def load(data_dir=None) -> Store:
     by_url: dict[str, list[int]] = {}
     for i, c in enumerate(chunks):
         by_url.setdefault(c["url"], []).append(i)
-    return Store(pages, chunks, manifest, guide, index, bm25, by_url)
+    return Store(pages, chunks, manifest, guide, index, bm25, body_texts, by_url)
 
 
 def index_age_days(store: Store) -> float:
     try:
         built = datetime.fromisoformat(store.manifest["built_at"])
-    except Exception:                                          # noqa: BLE001
+    except Exception:
         return 999.0
     if built.tzinfo is None:
         built = built.replace(tzinfo=timezone.utc)
@@ -82,7 +83,6 @@ def index_age_days(store: Store) -> float:
 
 
 def _expanded_tokens(text: str) -> list[str]:
-    """Query tokens plus synonym expansions, so BM25 can bridge abbreviations."""
     base = tokens(text)
     extra: list[str] = []
     for n in range(1, 5):
@@ -94,12 +94,6 @@ def _expanded_tokens(text: str) -> list[str]:
 
 
 def _semantic(raw_cos: float) -> float:
-    """Rescale cosine against this corpus's measured noise floor.
-
-    (cos + 1) / 2 is wrong for BGE: unrelated chunks in this corpus sit around
-    0.56 cosine, which that mapping turns into 0.78. Anchoring on the measured
-    unrelated p95 makes the number mean something.
-    """
     lo, hi = settings.COSINE_NOISE_FLOOR, settings.COSINE_SIGNAL_CEIL
     return max(0.0, min(1.0, (raw_cos - lo) / (hi - lo)))
 
@@ -114,7 +108,6 @@ def _rrf(rank_lists: list[list[int]]) -> dict[int, float]:
 
 def search_chunks(store: Store, query_text: str, exclude_urls: set[str],
                   k: int | None = None) -> list[dict]:
-    """Candidate chunks for one query string, as dicts with raw sub-scores."""
     k = k or settings.CANDIDATES_PER_CHUNK
     n_chunks = len(store.chunks)
     if n_chunks == 0:
@@ -134,13 +127,10 @@ def search_chunks(store: Store, query_text: str, exclude_urls: set[str],
         res, sc = store.bm25.retrieve(qt, k=lk, show_progress=False)
         lex_ids = [int(i) for i in res[0]]
         lex_raw = {int(i): float(s) for i, s in zip(res[0], sc[0])}
-    except Exception:                                          # noqa: BLE001
+    except Exception:
         pass
 
     fused = _rrf([dense_ids, lex_ids])
-
-    # Per-query normalisation of BM25. Never a global constant, never carried
-    # between queries: BM25 is unbounded and not comparable across queries.
     lex_max = max(lex_raw.values()) if lex_raw else 0.0
 
     out = []
@@ -163,8 +153,6 @@ def search_chunks(store: Store, query_text: str, exclude_urls: set[str],
 
 
 def collapse_to_pages(cands: list[dict], limit: int) -> list[dict]:
-    """Best chunk per page. Ties within 0.01 break on lowest chunk index, so an
-    overlapping chunk pair never yields two suggestions for one sentence."""
     best: dict[str, dict] = {}
     for c in cands:
         cur = best.get(c["url"])

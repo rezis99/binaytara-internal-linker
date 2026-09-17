@@ -1,8 +1,8 @@
 """The SOP rule engine (R1 to R11) plus scoring.
 
-Each rule is a separate, individually testable function. The block classifier has
-already enforced R1 to R4 by marking blocks ineligible, so only eligible chunks
-ever reach here; the rules below are the candidate-level filters.
+v3 change: final_score now accepts a keyword_score parameter from the keyword
+scanner. The keyword signal is weighted alongside semantic and lexical scores
+rather than being a bolt-on floor.
 """
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ def anchor_word_count_ok(anchor: str) -> bool:
 
 # ---------------------------------------------------------------- R9
 def url_ok(url: str) -> bool:
-    """Absolute https, main domain, no query string (SOP Rules 5 and 6)."""
     if not url or not url.startswith("https://"):
         return False
     if "?" in url or "#" in url:
@@ -33,16 +32,11 @@ def url_ok(url: str) -> bool:
 
 # ---------------------------------------------------------------- R7
 def already_linked_in_body(source_page: dict, target_url: str) -> bool:
-    """Navigation, breadcrumb and footer links deliberately do NOT count: a nav
-    link to X must not block a contextual body link to X."""
     return target_url in set(source_page.get("body_internal_links") or [])
 
 
 # ---------------------------------------------------------------- R10
 def contributor_named(target_page: dict, paragraph_text: str) -> tuple[bool, str]:
-    """A contributor page is only suggested when the person is named in the
-    paragraph. Surname-only forms additionally require an adjacent title or
-    credential, because a bare surname such as 'Shah' over-matches badly here."""
     if not ur.is_contributor(target_page["url"]):
         return True, ""
     text = paragraph_text or ""
@@ -63,7 +57,6 @@ def contributor_named(target_page: dict, paragraph_text: str) -> tuple[bool, str
 # ---------------------------------------------------------------- R11
 def conference_ok(target_page: dict, score: float,
                   today: date | None = None) -> tuple[bool, str, bool]:
-    """Return (keep, note, force_lower_band)."""
     if target_page.get("section") != "Conference":
         return True, "", False
     active, note = conference.is_active(target_page, today)
@@ -72,8 +65,6 @@ def conference_ok(target_page: dict, score: float,
     if score < settings.BAND_MEDIUM:
         return False, note, False
     if score < settings.CONFERENCE_MIN_SCORE:
-        # Not dropped silently: the writer would otherwise wonder why an
-        # obviously relevant conference never appears.
         return True, (f"{note}. Below the {settings.CONFERENCE_MIN_SCORE} conference "
                       "confidence minimum; verify relevance and dates before linking"), True
     return True, note, False
@@ -81,10 +72,6 @@ def conference_ok(target_page: dict, score: float,
 
 # ---------------------------------------------------------------- scoring
 def keyword_evidence(tier: int, match_type: str, anchor: str) -> float:
-    """Lexical evidence floor. An exact or synonym match on a specific phrase
-    from the target's approved anchor list or H1 is independent evidence that
-    the pages share a topic, so it sets a floor under relevance rather than
-    being thrown away when the embedding is unconvincing."""
     if tier > 2 or match_type not in ("Exact in text", "Synonym in text"):
         return 0.0
     words = [w for w in (anchor or "").lower().split() if w]
@@ -96,13 +83,29 @@ def keyword_evidence(tier: int, match_type: str, anchor: str) -> float:
 
 
 def final_score(semantic: float, lexical: float, anchor_score: float,
+                keyword_score: float = 0.0, title_sim: float = 0.0,
                 deorphan: bool = False, inbound: int = 0,
                 synthetic: bool = False, evidence: float = 0.0) -> float:
-    # Relevance first, anchor quality as a discount. Anchor quality says nothing
-    # about whether the target page belongs in this paragraph.
-    relevance = (settings.W_SEMANTIC * semantic + settings.W_LEXICAL * lexical) \
-        / (settings.W_SEMANTIC + settings.W_LEXICAL)
+    """v3 scoring: four weighted signals plus floors from keyword evidence,
+    keyword scan hits, and title similarity.
+
+    keyword_score comes from the keyword scanner (how many of the article's
+    disease terms appear in the target page's body text).
+    title_sim comes from pairwise H1 Jaccard similarity.
+    """
+    ws = settings.W_SEMANTIC
+    wl = settings.W_LEXICAL
+    wk = settings.W_KEYWORD
+    total_w = ws + wl + wk
+
+    relevance = (ws * semantic + wl * lexical + wk * keyword_score) / total_w
+    # Floors: any of these independent signals can rescue a candidate.
     relevance = max(relevance, evidence)
+    if keyword_score >= 0.30:
+        relevance = max(relevance, settings.KEYWORD_HIT_FLOOR)
+    if title_sim >= settings.TITLE_SIMILARITY_MIN:
+        relevance = max(relevance, settings.TITLE_SIMILARITY_FLOOR)
+
     s = relevance * (1.0 - settings.W_ANCHOR + settings.W_ANCHOR * anchor_score)
     if synthetic:
         s *= settings.SYNTHETIC_PENALTY
@@ -132,8 +135,6 @@ def benchmark(word_count: int) -> str:
 
 # ---------------------------------------------------------------- R5, R6
 def enforce_caps(rows: list[dict]) -> list[dict]:
-    """R6: each target page at most once per article, keeping the best placement.
-    R5: at most two suggestions per paragraph, keeping the highest scoring."""
     rows = sorted(rows, key=lambda r: -r["score"])
     best_for_target: dict[str, dict] = {}
     for r in rows:
@@ -158,16 +159,16 @@ DRAFT_PLACEHOLDER = "this article's URL once it is published"
 
 
 def display_url(url: str) -> str:
-    """An unpublished draft has no URL yet. Emitting the internal draft:// token
-    into a writer-facing instruction is useless and looks broken."""
     return DRAFT_PLACEHOLDER if (url or "").startswith(DRAFT_SCHEME) else url
 
 
-def modified_sentence(text: str, span, anchor: str, url: str, match_type: str) -> str:
-    """Markdown link inserted in place, or an instruction when the phrase is
-    absent. Phase 2 replaces the instruction with an LLM rewrite."""
+def modified_sentence(text: str, span, anchor: str, url: str, match_type: str,
+                      llm_rewrite: str | None = None) -> str:
+    """v3: if an LLM rewrite is provided for 'Needs insertion', use it."""
     shown = display_url(url)
     if match_type == "Needs insertion" or not span:
+        if llm_rewrite:
+            return llm_rewrite
         return (f'Writer to incorporate the phrase "{anchor}" naturally into this '
                 f"sentence, then link it to {shown}")
     start, end = span
