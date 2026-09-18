@@ -88,6 +88,36 @@ GENERIC_ANCHORS = {
     "health care", "healthcare", "medical care", "patient care",
     "cancer cases", "cancer patients", "cancer risk", "cancer care",
     "cancer treatment", "cancer screening", "cancer research", "cancer types",
+    # v4: flagged in the September 2026 writer review. Each of these was
+    # suggested as an anchor pointing at a category hub, where the phrase in
+    # running prose means something different from the destination. "all cancer"
+    # in "all cancer types share..." is not a link to the article index.
+    "all cancer", "all cancers", "all cancer types", "cancer awareness",
+    "awareness month", "cancer education", "cancer news", "the cancer news",
+    "all articles", "more articles", "related articles", "our articles",
+    "cancer information", "cancer resources", "cancer support",
+    "the disease", "this disease", "the condition", "this condition",
+    "the treatment", "this treatment", "the therapy", "this therapy",
+    "the symptoms", "these symptoms", "the diagnosis", "this diagnosis",
+    "risk factors", "the risk factors", "these risk factors",
+    "early detection", "early signs", "warning signs",
+    "the guidelines", "these guidelines", "current guidelines",
+    "clinical trials", "the clinical trial", "a clinical trial",
+    "new research", "new study", "a study", "a new study",
+    "the conference", "this conference", "the meeting", "the summit",
+    "last year", "this year", "next year", "recent years",
+}
+
+# v4: anchors that are purely geographic. A link reading "North India" or
+# "Tanzania" describes a place, not the destination page's topic, and was
+# flagged repeatedly in the writer review.
+GEOGRAPHIC_ANCHORS = {
+    "north india", "south india", "india", "nepal", "tanzania", "kenya",
+    "united states", "north america", "south america", "africa", "asia",
+    "europe", "new york", "california", "texas", "washington", "seattle",
+    "bellevue", "kathmandu", "san francisco", "philadelphia", "brooklyn",
+    "low and middle income countries", "developing countries",
+    "sub saharan africa", "the global south", "rural areas",
 }
 
 # A title fragment that begins with one of these is a mid-sentence slice, not a

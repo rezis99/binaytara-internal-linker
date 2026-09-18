@@ -27,6 +27,7 @@ class Store:
     index: object
     bm25: object
     body_texts: dict = field(default_factory=dict)    # v3: url -> lowercased body text
+    cannibalization: dict = field(default_factory=dict)  # v4: real query-overlap map
     by_url: dict = field(default_factory=dict)
 
     def page(self, url: str) -> dict | None:
@@ -50,6 +51,13 @@ def load(data_dir=None) -> Store:
     except FileNotFoundError:
         body_texts = {}
 
+    # v4: real keyword cannibalization from a Semrush export. Optional: when
+    # absent the engine falls back to the title heuristic and labels it as such.
+    try:
+        cannibal = json.loads((d / "cannibalization.json").read_text("utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        cannibal = {}
+
     if manifest.get("model_name") != settings.MODEL_NAME:
         raise RuntimeError(
             f"Index was built with {manifest.get('model_name')} but settings "
@@ -69,7 +77,8 @@ def load(data_dir=None) -> Store:
     by_url: dict[str, list[int]] = {}
     for i, c in enumerate(chunks):
         by_url.setdefault(c["url"], []).append(i)
-    return Store(pages, chunks, manifest, guide, index, bm25, body_texts, by_url)
+    return Store(pages, chunks, manifest, guide, index, bm25, body_texts,
+                 cannibal, by_url)
 
 
 def index_age_days(store: Store) -> float:

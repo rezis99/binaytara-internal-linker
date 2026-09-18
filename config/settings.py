@@ -92,6 +92,28 @@ LINK_BENCHMARK = [(500, "2 to 4"), (1000, "4 to 8"), (10 ** 9, "8 to 12")]
 OVERLAP_HIGH = 0.60
 OVERLAP_MEDIUM = 0.35
 
+# ---------- Keyword cannibalization, real query data (v4) ----------
+# Thresholds are in SHARED RANKING QUERIES, from a Semrush organic positions
+# export, not title similarity. Generate the map with:
+#   python -m engine.cannibalization_data <semrush-export.xlsx>
+# Measured on the September 2026 export: 496 keywords rank with more than one
+# URL; the worst pair (two ivermectin articles) shares 228 queries.
+CANNIBAL_HIGH_QUERIES = 10
+CANNIBAL_MEDIUM_QUERIES = 3
+
+# ---------- Awareness and conference matching (v4) ----------
+# "[Disease] Awareness Month" pages are overview hubs for a disease. When an
+# article is about that disease, the awareness page is almost always a valid
+# link target, but embeddings rank it poorly because its text is generic.
+AWARENESS_PATTERNS = [
+    r"\bawareness\s+month\b", r"\bawareness\s+week\b", r"\bawareness\s+day\b",
+]
+AWARENESS_MATCH_FLOOR = 0.60      # score floor when disease term matches
+
+# Conference recap pages mentioning a disease are valid targets for articles
+# about that disease.
+CONFERENCE_DISEASE_FLOOR = 0.52
+
 # ---------- Keyword scan (v3) ----------
 # Minimum term length and occurrence thresholds for the keyword scanner.
 KEYWORD_MIN_TERM_LEN = 4          # ignore very short terms

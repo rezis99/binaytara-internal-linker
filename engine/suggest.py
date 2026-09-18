@@ -19,7 +19,7 @@ import numpy as np
 from config import settings
 from config import url_rules as ur
 from engine import anchor as anchor_mod
-from engine import keyword_scan, retrieval, rules
+from engine import cannibalization_data, keyword_scan, retrieval, rules
 from engine import llm_rewrite
 from indexer import chunker, embedder
 
@@ -45,6 +45,10 @@ def _recommend_note(row: dict, page: dict, is_best: bool) -> str:
         bits.append(row["keyword_note"])
     if row.get("title_sim_note"):
         bits.append(row["title_sim_note"])
+    # v4: journal articles should be placed in a references section, not body.
+    if row.get("is_journal_target"):
+        bits.append("IJCCD research paper: consider placing in references or "
+                     "'Works discussed' section rather than body prose")
     return ". ".join(b for b in bits if b)
 
 
@@ -57,10 +61,15 @@ def links_to_give(article: dict, store: retrieval.Store,
     already = set(article.get("body_internal_links") or [])
     exclude = {article["url"]}
 
-    # v3: pre-compute keyword scan and title similarity for all pages.
+    # v3/v4: pre-compute keyword scan, title similarity, awareness matching.
+    body_texts = getattr(store, "body_texts", {}) or {}
     article_terms = keyword_scan.extract_terms(article)
-    kw_scores = keyword_scan.scan_pages(article_terms, store.body_texts, exclude | already)
+    kw_scores = keyword_scan.scan_pages(article_terms, body_texts, exclude | already)
     title_sims = keyword_scan.title_similarity(article, store.pages, exclude | already)
+    # v4: awareness-month pages and conference recaps for this article's diseases.
+    aware = keyword_scan.awareness_and_conference_matches(
+        article, store.pages, exclude | already)
+    cmap = getattr(store, "cannibalization", {}) or {}
 
     # Collect all candidate URLs from three sources:
     # 1. Embedding retrieval (per-chunk)
@@ -90,16 +99,33 @@ def links_to_give(article: dict, store: retrieval.Store,
 
             evaluated_targets.add(target["url"])
 
+            # v4: IJCCD articles as link targets need special handling. A journal
+            # paper should only be suggested when its core disease matches the
+            # source article's topic (not just any n-gram overlap), and the
+            # placement should go in the references / "Works discussed" section,
+            # not in the body prose. If neither the article nor the journal share
+            # a disease term, skip it. The reviewer already said: "only suggest
+            # if you are sure the journal matches the study."
+            is_journal = target.get("section") == "IJCCD"
+            if is_journal:
+                src_diseases = keyword_scan.article_diseases(article)
+                tgt_blob = f"{target.get('h1') or ''} {target.get('title_clean') or ''}".lower()
+                disease_hit = any(d in tgt_blob for d in src_diseases)
+                if not disease_hit:
+                    continue  # no shared disease term: skip this journal target
+
             named_ok, name_note = rules.contributor_named(target, chunk["text"])
             if not named_ok:
                 continue
 
             # v3: relaxed hard gate (was 0.70, now 0.55).
             if cand["raw_cosine"] < settings.COSINE_HARD_MIN:
-                # But keyword scan or title similarity can rescue it.
+                # Keyword scan, title similarity or an awareness/conference
+                # disease match can rescue it.
                 kw = kw_scores.get(target["url"], 0.0)
                 ts = title_sims.get(target["url"], 0.0)
-                if kw < 0.20 and ts < settings.TITLE_SIMILARITY_MIN:
+                if kw < 0.20 and ts < settings.TITLE_SIMILARITY_MIN \
+                        and target["url"] not in aware:
                     continue
 
             best = anchor_mod.select(target, chunk["text"], store.guide)
@@ -114,10 +140,11 @@ def links_to_give(article: dict, store: retrieval.Store,
 
             kw = kw_scores.get(target["url"], 0.0)
             ts = title_sims.get(target["url"], 0.0)
+            aw_floor, aw_reason = aware.get(target["url"], (0.0, ""))
 
             score = rules.final_score(
                 cand["semantic_score"], cand["lexical_score"], best["anchor_score"],
-                keyword_score=kw, title_sim=ts,
+                keyword_score=kw, title_sim=ts, extra_floor=aw_floor,
                 deorphan=deorphan, inbound=target.get("inbound_link_count", 0),
                 synthetic=not cand["chunk"].get("placement_ok", True),
                 evidence=rules.keyword_evidence(
@@ -133,7 +160,7 @@ def links_to_give(article: dict, store: retrieval.Store,
             if force_lower:
                 b = "Lower"
 
-            level, why = rules.overlap(article, target, best["anchor"])
+            level, why, basis = rules.overlap(article, target, best["anchor"], cmap)
 
             # v3: LLM rewrite for "Needs insertion" rows.
             llm_text = None
@@ -147,6 +174,8 @@ def links_to_give(article: dict, store: retrieval.Store,
 
             kw_note = f"Keyword match: {kw:.0%}" if kw >= 0.10 else ""
             ts_note = f"Same-topic match: {ts:.0%}" if ts >= settings.TITLE_SIMILARITY_MIN else ""
+            if aw_reason:
+                ts_note = ". ".join(x for x in (ts_note, aw_reason) if x)
 
             group.append({
                 "block_index": chunk["block_index"],
@@ -162,10 +191,14 @@ def links_to_give(article: dict, store: retrieval.Store,
                 "match_type": best["match_type"],
                 "overlap_level": level,
                 "overlap_why": why,
+                "overlap_basis": basis,
                 "score": score,
                 "extra_note": ". ".join(x for x in (name_note, conf_note) if x),
                 "keyword_note": kw_note,
                 "title_sim_note": ts_note,
+                "is_topical": bool(kw >= 0.15 or ts >= settings.TITLE_SIMILARITY_MIN
+                                   or aw_floor > 0 or cand["raw_cosine"] >= 0.62),
+                "is_journal_target": is_journal,
                 "_page": target,
             })
 
@@ -194,7 +227,8 @@ def links_to_give(article: dict, store: retrieval.Store,
 
             kw = kw_scores.get(url, 0.0)
             ts = title_sims.get(url, 0.0)
-            if kw < 0.15 and ts < settings.TITLE_SIMILARITY_MIN:
+            aw_floor, aw_reason = aware.get(url, (0.0, ""))
+            if kw < 0.15 and ts < settings.TITLE_SIMILARITY_MIN and aw_floor <= 0:
                 continue
 
             # Find the best chunk for this target by trying anchor matching.
@@ -222,7 +256,7 @@ def links_to_give(article: dict, store: retrieval.Store,
 
                 score = rules.final_score(
                     sem, 0.0, best["anchor_score"],
-                    keyword_score=kw, title_sim=ts,
+                    keyword_score=kw, title_sim=ts, extra_floor=aw_floor,
                     deorphan=deorphan, inbound=target.get("inbound_link_count", 0),
                     evidence=rules.keyword_evidence(
                         best["tier"], best["match_type"], best["anchor"]))
@@ -267,10 +301,14 @@ def links_to_give(article: dict, store: retrieval.Store,
                         "match_type": best["match_type"],
                         "overlap_level": level,
                         "overlap_why": why,
+                        "overlap_basis": basis,
                         "score": score,
                         "extra_note": ". ".join(x for x in (name_note, conf_note) if x),
                         "keyword_note": kw_note,
                         "title_sim_note": ts_note,
+                        "is_topical": bool(kw >= 0.15
+                                           or ts >= settings.TITLE_SIMILARITY_MIN
+                                           or aw_floor > 0),
                         "notes": "",
                     }
 
@@ -309,9 +347,23 @@ def links_to_receive(article: dict, store: retrieval.Store,
         queries.extend(c["text"] for c in placeable[:3])
 
     # v3: keyword scan and title similarity to find pages that should link here.
+    body_texts = getattr(store, "body_texts", {}) or {}
+    cmap = getattr(store, "cannibalization", {}) or {}
     article_terms = keyword_scan.extract_terms(article)
-    kw_scores = keyword_scan.scan_pages(article_terms, store.body_texts, {article["url"]})
-    title_sims = keyword_scan.title_similarity(article, store.pages, {article["url"]})
+
+    # v4 (review item #3): pages that ALREADY link to this article must not be
+    # suggested as inbound opportunities. The v3 code only checked this for
+    # published articles inside the loop, which let an already-linking page
+    # through whenever its chunk came from the keyword scanner instead of
+    # embedding retrieval.
+    already_inbound = {
+        u for u, p in store.pages.items()
+        if article["url"] in set(p.get("body_internal_links") or [])
+    }
+    recv_exclude = {article["url"]} | already_inbound
+
+    kw_scores = keyword_scan.scan_pages(article_terms, body_texts, recv_exclude)
+    title_sims = keyword_scan.title_similarity(article, store.pages, recv_exclude)
 
     fused: dict[str, dict] = {}
     for q in queries:
@@ -353,6 +405,11 @@ def links_to_receive(article: dict, store: retrieval.Store,
         chunk = cand["chunk"]
         if source is None or not _sections_filter(source, allowed_sections):
             continue
+        # v4: IJCCD articles are published research. Nobody is going back into a
+        # journal paper to insert a link to a TCN article. Skip them entirely on
+        # the receive side.
+        if source.get("section") == "IJCCD":
+            continue
         # v3: relaxed hard gate; keyword/title signals can rescue.
         kw = kw_scores.get(cand["url"], 0.0)
         ts = title_sims.get(cand["url"], 0.0)
@@ -385,7 +442,7 @@ def links_to_receive(article: dict, store: retrieval.Store,
         b = rules.band(score)
         if b is None:
             continue
-        level, why = rules.overlap(source, article, best["anchor"])
+        level, why, basis = rules.overlap(source, article, best["anchor"], cmap)
 
         # LLM rewrite for receive-side needs-insertion.
         llm_text = None
@@ -414,7 +471,10 @@ def links_to_receive(article: dict, store: retrieval.Store,
             "match_type": best["match_type"],
             "overlap_level": level,
             "overlap_why": why,
+            "overlap_basis": basis,
             "score": score,
+            "is_topical": bool(kw >= 0.15 or ts >= settings.TITLE_SIMILARITY_MIN
+                               or cand["raw_cosine"] >= 0.62),
             "notes": notes,
         })
 

@@ -75,7 +75,10 @@ def ngrams(text: str, lo: int | None = None, hi: int | None = None) -> list[str]
                 continue
             if low[0] in sel.SERP_VERBS or low[0] in sel.FRAGMENT_STARTERS:
                 continue
-            if " ".join(low) in sel.GENERIC_ANCHORS:
+            phrase_low = " ".join(low)
+            if phrase_low in sel.GENERIC_ANCHORS:
+                continue
+            if phrase_low in sel.GEOGRAPHIC_ANCHORS:
                 continue
             # A phrase pulled from the middle of a title must still read as a
             # noun phrase; require it to start at the title head or right after

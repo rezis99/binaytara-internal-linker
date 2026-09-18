@@ -156,6 +156,63 @@ def strip_brand(title: str) -> str:
     return re.sub(r"\s+", " ", out).strip(" |\u2502-").strip() or title.strip()
 
 
+def _sig_words(text: str) -> set[str]:
+    """Significant words for consistency checking."""
+    stop = {"the", "and", "for", "with", "from", "that", "this", "what", "how",
+            "are", "was", "cancer", "new", "your", "you", "can", "все"}
+    return {w for w in re.findall(r"[a-z]+", (text or "").lower())
+            if len(w) > 3 and w not in stop}
+
+
+def h1_is_consistent(h1: str, title: str, url: str) -> tuple[bool, str]:
+    """Detect the CMS bug where a page serves an H1 belonging to a DIFFERENT
+    article while its <title> and canonical are correct.
+
+    Measured on binaytara.org in September 2026: roughly 10% of TCN articles
+    (4 of a 40-article random sample) served a foreign H1. Example: the page at
+    /cancernews/article/kidney-cancer-dual-io-hif2a-tki-free-intervals returned
+    <title>Kidney Cancer in 2026...</title> with
+    <h1>Reaching Out-of-School Maasai Girls With HPV Vaccination...</h1>.
+
+    Storing that H1 is what produced the 'ghost data' and 'URL/title mismatch'
+    findings in the writer review: the tool was faithfully reporting a value the
+    CMS got wrong. Until the template is fixed, trust the title over the H1
+    whenever the H1 shares no vocabulary with the slug but the title does.
+
+    Returns (is_consistent, reason).
+    """
+    if not h1 or not title:
+        return True, ""            # nothing to contradict
+    slug = (url or "").rstrip("/").split("/")[-1]
+    slug_w = _sig_words(slug.replace("-", " "))
+    h1_w = _sig_words(h1)
+    title_w = _sig_words(title)
+
+    if not h1_w or not title_w:
+        return True, ""
+
+    # Signal A: the H1 and the <title> describe different articles. On a healthy
+    # page these two always overlap heavily; they are generated from the same
+    # field. Near-zero overlap is the clearest evidence of the CMS bug and does
+    # not depend on how the slug happens to be worded.
+    h1_title = len(h1_w & title_w) / min(len(h1_w), len(title_w))
+    if len(h1_w) >= 3 and len(title_w) >= 3 and h1_title < 0.15:
+        return False, (f"H1 and page title share no vocabulary "
+                       f"({h1_title:.0%} overlap). The CMS is serving an H1 from a "
+                       "different article.")
+
+    # Signal B: relative to the URL slug, the title matches and the H1 does not.
+    # Catches cases where H1 and title share an incidental common word.
+    if slug_w:
+        h1_slug = len(slug_w & h1_w) / len(slug_w)
+        title_slug = len(slug_w & title_w) / len(slug_w)
+        if h1_slug < 0.20 and title_slug >= 0.20 and title_slug > h1_slug:
+            return False, (f"H1 does not match the URL slug but the title does "
+                           f"(slug overlap: H1 {h1_slug:.0%}, title {title_slug:.0%}). "
+                           "The CMS is serving an H1 from a different article.")
+    return True, ""
+
+
 def person_name_variants(full_name: str) -> list[str]:
     full_name = re.sub(r"\s+", " ", (full_name or "").strip())
     full_name = re.sub(r",?\s*(MD|PhD|DO|MPH|RN|DNB|MBBS)\b\.?", "", full_name, flags=re.I).strip()
@@ -222,7 +279,19 @@ def extract(html: str, final_url: str) -> dict | None:
         "\n".join([h1, title, meta_desc, body_text]).encode("utf-8")
     ).hexdigest()
 
-    names = person_name_variants(h1) if section == "Contributor" else []
+    title_clean = strip_brand(title or og_title)
+
+    # v4: guard against the CMS serving a foreign H1 (see h1_is_consistent).
+    h1_ok, h1_reason = h1_is_consistent(h1, title, final_url)
+    h1_stored = h1 if h1_ok else ""
+    if not h1_ok:
+        # Keep the raw value for reporting, but do NOT let it into h1, where it
+        # would become the displayed page title and an anchor-text source.
+        h1_suspect = h1
+    else:
+        h1_suspect = ""
+
+    names = person_name_variants(h1_stored or title_clean) if section == "Contributor" else []
 
     return {
         "url": final_url,
@@ -230,8 +299,10 @@ def extract(html: str, final_url: str) -> dict | None:
         "section": section,
         "body_available": body_available,
         "title": title,
-        "title_clean": strip_brand(title or og_title),
-        "h1": h1,
+        "title_clean": title_clean,
+        "h1": h1_stored,
+        "h1_suspect": h1_suspect,
+        "h1_mismatch_reason": h1_reason,
         "meta_description": "" if placeholder else meta_desc,
         "meta_description_is_placeholder": placeholder,
         "abstract": abstract,

@@ -110,6 +110,7 @@ def build(limit: int | None = None, out_dir: Path | None = None,
     extraction_failed = []
     canonical_mismatches = []
     canonical_collisions = []
+    h1_mismatches = []           # v4: CMS serving a foreign H1
 
     for item in fetched:
         rec = extract(item["html"], item["final_url"])
@@ -153,6 +154,15 @@ def build(limit: int | None = None, out_dir: Path | None = None,
             if n and n != target:
                 redirects[n] = target
 
+        # v4: record pages where the CMS served an H1 from another article.
+        if rec.get("h1_suspect"):
+            h1_mismatches.append({
+                "url": target,
+                "title": rec.get("title_clean", ""),
+                "wrong_h1": rec.get("h1_suspect", ""),
+                "reason": rec.get("h1_mismatch_reason", ""),
+            })
+
         # Store body text for the keyword scanner (v3).
         raw_body = rec.pop("_body_text", "")
         if raw_body:
@@ -179,7 +189,8 @@ def build(limit: int | None = None, out_dir: Path | None = None,
     print(f"  pages={len(pages)} chunks={len(all_chunks)} redirects={len(redirects)} "
           f"target_only={target_only} extraction_failed={len(extraction_failed)} "
           f"canonical_mismatches={len(canonical_mismatches)} "
-          f"canonical_collisions={len(canonical_collisions)}")
+          f"canonical_collisions={len(canonical_collisions)} "
+          f"h1_mismatches={len(h1_mismatches)}")
     if not all_chunks:
         raise RuntimeError("no eligible chunks produced; check the selectors")
 
@@ -263,6 +274,10 @@ def build(limit: int | None = None, out_dir: Path | None = None,
             {"from": c.get("page", ""), "detail": c}
             for c in canonical_collisions[:20]
         ],
+        # v4: full list, not truncated. This is a CMS defect report that goes to
+        # the dev team, so every affected URL has to be in it.
+        "h1_mismatches": h1_mismatches,
+        "h1_mismatch_count": len(h1_mismatches),
         "build_seconds": None,
         "redirects": redirects,
         "lastmod": {u: lastmod.get(pages[u].get("sitemap_url")) for u in pages},

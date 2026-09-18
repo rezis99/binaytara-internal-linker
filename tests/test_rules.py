@@ -13,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import url_rules as ur                              # noqa: E402
 from engine import anchor, cannibalization, conference, rules    # noqa: E402
 from engine import keyword_scan                                  # noqa: E402
+from engine import cannibalization_data                          # noqa: E402
+from indexer.extractor import h1_is_consistent                   # noqa: E402
 from engine import llm_rewrite                                   # noqa: E402
 from indexer.blocks import Block, classify                       # noqa: E402
 from indexer.extractor import person_name_variants, strip_brand  # noqa: E402
@@ -377,11 +379,131 @@ def test_misc():
               llm_rewrite="already rewritten with [kidney cancer](https://x)"))
 
 
+def test_h1_cms_guard():
+    """v4: the CMS serves a foreign H1 on roughly 10% of TCN articles. These are
+    real cases measured against the live site in September 2026."""
+    print("\nH1 CMS defect guard (v4)")
+    bad = [
+        ("Reaching Out-of-School Maasai Girls With HPV Vaccination: Cervical Cancer Prevention in Tanzania",
+         "Kidney Cancer in 2026: Immunotherapy, HIF-2 Alpha, TKIs",
+         "https://binaytara.org/cancernews/article/kidney-cancer-dual-io-hif2a-tki-free-intervals",
+         "Maasai H1 on the kidney cancer page"),
+        ("AL Amyloidosis, POEMS Syndrome, and Extramedullary Myeloma",
+         "Colorectal Cancer: Exercise, Aspirin, and Immunotherapy",
+         "https://binaytara.org/cancernews/article/colorectal-cancer-exercise-aspirin-immunotherapy",
+         "amyloidosis H1 on the colorectal page"),
+        ("Dr. David Zhen on Advances in Neuroendocrine Tumor Treatment",
+         "Multi-Omics & AI in Precision Health: Dr. Michael Snyder",
+         "https://binaytara.org/cancernews/article/dr-michael-snyder-on-advances-in-genomic-medicine",
+         "wrong physician H1"),
+    ]
+    for h1, title, url, label in bad:
+        ok, _ = h1_is_consistent(h1, title, url)
+        check(f"detects {label}", not ok)
+
+    good = [
+        ("Stomach Cancer 101", "Stomach Cancer 101: Symptoms, Causes and Treatment",
+         "https://binaytara.org/cancernews/article/stomach-cancer-101", "matching H1"),
+        ("Alcohol and Cancer Risk: What the Evidence Shows",
+         "Alcohol and Cancer Risk | The Cancer News",
+         "https://binaytara.org/cancernews/article/alcohol-cancer-risk", "alcohol article"),
+        ("", "Some Title", "https://binaytara.org/x/y", "empty H1"),
+        ("Belzutifan in 2026: Three Phase 3 Trials",
+         "Belzutifan in 2026: Three Phase 3 Trials",
+         "https://binaytara.org/cancernews/article/belzutifan-in-2026", "short slug"),
+    ]
+    for h1, title, url, label in good:
+        ok, _ = h1_is_consistent(h1, title, url)
+        check(f"does not flag {label}", ok)
+
+
+def test_real_cannibalization():
+    print("\nReal keyword cannibalization (v4)")
+    iver_a = "https://binaytara.org/cancernews/article/caution-about-ivermectin-for-cancer-treatment-from-an-oncologist"
+    iver_b = "https://binaytara.org/cancernews/article/what-cancer-doctors-are-saying-about-ivermectin-and-cancer-treatment"
+    cmap = {
+        iver_a: {iver_b: {"shared": 228, "volume": 43170,
+                          "top_terms": ["ivermectin for cancer", "ivermectin and cancer"]}},
+        iver_b: {iver_a: {"shared": 228, "volume": 43170,
+                          "top_terms": ["ivermectin for cancer", "ivermectin and cancer"]}},
+    }
+    lvl, why = cannibalization_data.assess(iver_a, iver_b, cmap)
+    check("228 shared queries flagged High", lvl == "High", lvl)
+    check("explanation names the query count", "228" in why, why)
+    lvl, _ = cannibalization_data.assess(iver_a, "https://binaytara.org/unrelated", cmap)
+    check("uncompeting pair returns None", lvl == "None", lvl)
+    lvl, _ = cannibalization_data.assess(iver_a, iver_b, {})
+    check("empty map returns no verdict", lvl == "", lvl)
+
+    src = {"url": iver_a, "h1": "Ivermectin Caution", "title_clean": "", "meta_description": ""}
+    tgt = {"url": iver_b, "h1": "What Doctors Say", "title_clean": "", "meta_description": ""}
+    lvl, why, basis = rules.overlap(src, tgt, "ivermectin dosage", cmap)
+    check("rules.overlap reports query-data basis", basis == "query data", basis)
+    lvl2, why2, basis2 = rules.overlap(src, tgt, "ivermectin dosage", {})
+    check("falls back to the labelled heuristic", basis2 == "title heuristic", basis2)
+
+
+def test_awareness_matching():
+    print("\nAwareness and conference matching (v4)")
+    art = {"h1": "Kidney Cancer in 2026: Immunotherapy, HIF-2 Alpha, TKIs",
+           "title_clean": "Kidney Cancer in 2026",
+           "blocks": [{"kind": "p", "text": "Kidney cancer treatment advanced fast."}]}
+    check("article disease detected", "kidney cancer" in keyword_scan.article_diseases(art))
+
+    pages = {
+        "https://binaytara.org/cancernews/article/kidney-cancer-awareness-month":
+            {"h1": "Kidney Cancer Awareness Month", "title_clean": "Kidney Cancer Awareness Month",
+             "section": "TCN", "url": "https://binaytara.org/cancernews/article/kidney-cancer-awareness-month"},
+        "https://binaytara.org/cancernews/article/breast-cancer-101":
+            {"h1": "Breast Cancer 101", "title_clean": "Breast Cancer 101",
+             "section": "TCN", "url": "https://binaytara.org/cancernews/article/breast-cancer-101"},
+        "https://binaytara.org/projects/conferences/gu-2026":
+            {"h1": "GU Cancers Summit: kidney cancer sessions", "title_clean": "GU Cancers Summit",
+             "section": "Conference", "url": "https://binaytara.org/projects/conferences/gu-2026"},
+    }
+    m = keyword_scan.awareness_and_conference_matches(art, pages, set())
+    check("Kidney Cancer Awareness Month found (review item #6)",
+          "https://binaytara.org/cancernews/article/kidney-cancer-awareness-month" in m, list(m))
+    check("conference recap matched on disease (review item #7)",
+          "https://binaytara.org/projects/conferences/gu-2026" in m, list(m))
+    check("unrelated disease page not matched",
+          "https://binaytara.org/cancernews/article/breast-cancer-101" not in m, list(m))
+
+    # A specific disease must not also drag in the generic parent term.
+    art2 = {"h1": "Stomach Cancer 101", "title_clean": "Stomach Cancer 101", "blocks": []}
+    d = keyword_scan.article_diseases(art2)
+    check("specific disease term wins", d == {"stomach cancer"}, d)
+
+
+def test_blocked_anchors_v4():
+    print("\nGeneric and geographic anchor blocklist (v4)")
+    for bad in ["all cancer", "cancer awareness", "risk factors", "early detection"]:
+        check(f"'{bad}' earns no keyword evidence",
+              rules.keyword_evidence(2, "Exact in text", bad) == 0.0)
+    for geo in ["north india", "tanzania", "united states", "new york"]:
+        check(f"geographic anchor '{geo}' earns no evidence",
+              rules.keyword_evidence(2, "Exact in text", geo) == 0.0)
+    check("a real topical anchor still earns evidence",
+          rules.keyword_evidence(2, "Exact in text", "stomach cancer") > 0)
+
+
+def test_extra_floor():
+    print("\nAwareness score floor (v4)")
+    base = rules.final_score(0.1, 0.1, 0.9)
+    lifted = rules.final_score(0.1, 0.1, 0.9, extra_floor=0.60)
+    check("awareness floor lifts a weak embedding match", lifted > base,
+          f"{lifted:.3f} vs {base:.3f}")
+    check("awareness floor reaches at least Medium",
+          rules.band(lifted) in ("High", "Medium"), rules.band(lifted))
+
+
 if __name__ == "__main__":
     for fn in (test_blocks, test_urls, test_r7, test_anchor, test_caps,
                test_contributor, test_conference, test_overlap,
                test_keyword_scan, test_title_similarity, test_llm_validation,
-               test_scoring_v3, test_misc):
+               test_scoring_v3, test_h1_cms_guard, test_real_cannibalization,
+               test_awareness_matching, test_blocked_anchors_v4,
+               test_extra_floor, test_misc):
         fn()
     print("\n" + "=" * 60)
     if FAILURES:

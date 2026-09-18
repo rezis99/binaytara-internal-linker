@@ -30,10 +30,20 @@ def give_table(rows):
         "Target Page Title": r["target_title"],
         "Section": r["section"],
         "Match Type": r["match_type"],
-        "Topic Overlap (heuristic)": (
-            r["overlap_level"] + (f": {r['overlap_why']}" if r["overlap_why"] else "")),
+        "Keyword Competition": _competition(r),
         "Notes": r["notes"],
     } for r in rows]
+
+
+def _competition(r):
+    """Label the competition signal AND where it came from, so a writer can tell
+    measured query data from an inferred title match."""
+    level = r.get("overlap_level") or "None"
+    basis = r.get("overlap_basis") or "title heuristic"
+    if level in ("", "None"):
+        return f"None ({basis})"
+    why = r.get("overlap_why") or ""
+    return f"{level} ({basis}): {why}" if why else f"{level} ({basis})"
 
 
 def receive_table(rows):
@@ -46,13 +56,12 @@ def receive_table(rows):
         "Modified Sentence": r["modified_sentence"],
         "Anchor Text": r["anchor"],
         "Match Type": r["match_type"],
-        "Topic Overlap (heuristic)": (
-            r["overlap_level"] + (f": {r['overlap_why']}" if r["overlap_why"] else "")),
+        "Keyword Competition": _competition(r),
         "Notes": r["notes"],
     } for r in rows]
 
 
-def render(res):
+def render(res, key_prefix: str = ""):
     a = res["article"]
     c = st.columns(5)
     c[0].metric("Word count", f"{a['word_count']:,}")
@@ -61,28 +70,46 @@ def render(res):
     c[3].metric("Links to receive", len(res["receive"]))
     c[4].metric("Existing body links", len(a["existing_links"]))
 
-    t1, t2, t3 = st.tabs([
-        f"Links to Give ({len(res['give'])})",
+    # v4 (review item #8): topical matches and orphan-rescue candidates are
+    # different editorial decisions, so they are separated rather than left for
+    # the reviewer to sort by hand.
+    give_top = [r for r in res["give"] if r.get("is_topical", True)]
+    give_other = [r for r in res["give"] if not r.get("is_topical", True)]
+
+    t1, t2, t3, t4 = st.tabs([
+        f"Links to Give: topical ({len(give_top)})",
+        f"Links to Give: other ({len(give_other)})",
         f"Links to Receive ({len(res['receive'])})",
         f"Existing links ({len(a['existing_links'])})",
     ])
     with t1:
-        st.caption("Where in this article to place links out to existing pages. "
-                   "The first paragraph, Key Takeaways, references and direct "
-                   "quotes are excluded per the Content Publishing SOP.")
-        if res["give"]:
-            st.dataframe(give_table(res["give"]), use_container_width=True,
+        st.caption("Strong topical matches: the target shares this article's "
+                   "disease terms, title vocabulary, or is its awareness page. "
+                   "Start here. The first paragraph, Key Takeaways, references "
+                   "and direct quotes are excluded per the Content Publishing SOP.")
+        if give_top:
+            st.dataframe(give_table(give_top), use_container_width=True,
                          hide_index=True)
         else:
-            st.info("No suggestions cleared the relevance threshold.")
+            st.info("No topical suggestions cleared the relevance threshold.")
     with t2:
-        st.caption("Existing pages that should add a link pointing to this article.")
+        st.caption("Weaker or exploratory matches, including low-inbound pages "
+                   "surfaced for de-orphaning. Review these only after the "
+                   "topical tab.")
+        if give_other:
+            st.dataframe(give_table(give_other), use_container_width=True,
+                         hide_index=True)
+        else:
+            st.info("Nothing here. Every suggestion was a topical match.")
+    with t3:
+        st.caption("Existing pages that should add a link pointing to this "
+                   "article. Pages that already link here are excluded.")
         if res["receive"]:
             st.dataframe(receive_table(res["receive"]), use_container_width=True,
                          hide_index=True)
         else:
             st.info("No suggestions cleared the relevance threshold.")
-    with t3:
+    with t4:
         if a["existing_links"]:
             st.write("These are already linked from the article body, so they are "
                      "never suggested again:")
@@ -110,7 +137,14 @@ def main():
         st.header("Options")
         mode = st.radio("Mode", ["Single article", "Batch"], horizontal=True)
         chosen = st.multiselect("Suggest links from these sections",
-                                suggest.SECTIONS, default=suggest.SECTIONS)
+                                suggest.SECTIONS, default=suggest.SECTIONS,
+                                help=("TCN = Cancer News articles. "
+                                      "IJCCD = journal research papers. "
+                                      "Blog = organizational news. "
+                                      "Conference = individual event pages. "
+                                      "Project = hubs like OncoBlast, the conference index. "
+                                      "Static = evergreen pages (about, research grants). "
+                                      "Contributor = author profile pages."))
         show_lower = st.checkbox("Show lower relevance suggestions", value=False)
         deorphan = False
         if mode == "Batch":
@@ -119,11 +153,19 @@ def main():
                 help="Boosts pages that currently have few inbound internal links.")
         st.divider()
         st.caption(f"Pages indexed: {store.manifest.get('pages', 0):,}")
-        body_count = store.manifest.get("body_texts_stored", len(getattr(store, "body_texts", {})))
+        body_count = store.manifest.get("body_texts_stored", len(store.body_texts))
         st.caption(f"Body texts stored: {body_count:,}")
         st.caption(f"Database built: {store.manifest.get('built_at', '')[:10]}")
         version = store.manifest.get("version", 2)
         st.caption(f"Index version: {version}")
+        cmap = getattr(store, "cannibalization", {}) or {}
+        if cmap:
+            st.caption(f"Keyword competition: real query data ({len(cmap):,} URLs)")
+        else:
+            st.caption("Keyword competition: title heuristic (no Semrush map)")
+        h1bad = store.manifest.get("h1_mismatch_count", 0)
+        if h1bad:
+            st.caption(f"CMS H1 defects detected: {h1bad}")
         llm_ok, llm_provider = llm_rewrite.is_available()
         if llm_ok:
             st.caption(f"✅ LLM rewriting: {llm_provider}")
@@ -185,12 +227,24 @@ def main():
     if results:
         st.divider()
         if len(results) == 1:
-            render(results[0])
+            render(results[0], key_prefix="single")
         else:
-            for res in results:
-                with st.expander(f"{res['article']['title']}  "
-                                 f"({len(res['give'])} give / {len(res['receive'])} receive)"):
-                    render(res)
+            # v4: one top-level tab per article. The v3 build nested each
+            # article's own st.tabs inside an expander; Streamlit keys tab
+            # widgets by position, so every article's inner tabs resolved to the
+            # first article's state and the batch appeared to analyse one URL.
+            labels = []
+            for i, res in enumerate(results, 1):
+                name = res["article"]["title"] or res["article"]["url"]
+                short = (name[:34] + "...") if len(name) > 37 else name
+                labels.append(f"{i}. {short}")
+            for tab, (i, res) in zip(st.tabs(labels), enumerate(results, 1)):
+                with tab:
+                    a = res["article"]
+                    st.markdown(f"**{a['title']}**")
+                    if not a["is_draft"]:
+                        st.caption(a["url"])
+                    render(res, key_prefix=f"a{i}")
         st.download_button(
             "⬇ Download Excel",
             data=excel_writer.build_workbook(results),

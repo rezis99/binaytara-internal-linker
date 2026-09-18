@@ -32,17 +32,22 @@ OVERLAP_FONT = {
 WRAP = Alignment(wrap_text=True, vertical="top")
 LEFT_MARK = Border(left=Side(style="thick", color="1F4E79"))
 
+# v4 (review item #9): decision columns first. A reviewer reads left to right
+# and decides yes/no before reading the sentence, so Relevance, Match Type and
+# the competition flag lead. "Use?" is an empty column the reviewer fills in.
 GIVE_COLS = [
-    ("Existing Sentence", 60), ("Modified Sentence", 60), ("Anchor Text", 22),
-    ("Target Page Link", 46), ("Target Page Title", 34), ("Section", 12),
-    ("Relevance", 11), ("Match Type", 17), ("Topic Overlap (heuristic)", 26),
-    ("Notes", 44),
+    ("Use?", 8), ("Relevance", 11), ("Match Type", 17),
+    ("Keyword Competition", 30), ("Anchor Text", 22),
+    ("Target Page Title", 34), ("Target Page Link", 46), ("Section", 12),
+    ("Existing Sentence", 58), ("Modified Sentence", 58),
+    ("Notes", 42),
 ]
 RECEIVE_COLS = [
-    ("Source Page", 46), ("Source Page Title", 34), ("Section", 12),
-    ("Existing Sentence", 60), ("Modified Sentence", 60), ("Anchor Text", 22),
-    ("Relevance", 11), ("Match Type", 17), ("Topic Overlap (heuristic)", 26),
-    ("Notes", 44),
+    ("Use?", 8), ("Relevance", 11), ("Match Type", 17),
+    ("Keyword Competition", 30), ("Anchor Text", 22),
+    ("Source Page Title", 34), ("Source Page", 46), ("Section", 12),
+    ("Existing Sentence", 58), ("Modified Sentence", 58),
+    ("Notes", 42),
 ]
 
 _DANGEROUS = ("=", "+", "-", "@", "\t", "\r")
@@ -102,21 +107,32 @@ def _link(ws, row_i: int, col: int, url: str) -> None:
     cell.alignment = WRAP
 
 
+def _competition_text(r) -> str:
+    level = r.get("overlap_level") or "None"
+    basis = r.get("overlap_basis") or "title heuristic"
+    if level in ("", "None"):
+        return f"None ({basis})"
+    why = r.get("overlap_why") or ""
+    return f"{level} ({basis}): {why}" if why else f"{level} ({basis})"
+
+
 def write_give(ws, rows: list[dict]) -> None:
     _header(ws, GIVE_COLS)
     for i, r in enumerate(rows, start=2):
-        overlap = f"{r['overlap_level']}" + (f": {r['overlap_why']}" if r["overlap_why"] else "")
-        values = [r["existing_sentence"], r["modified_sentence"], r["anchor"], None,
-                  r["target_title"], r["section"], r["relevance"], r["match_type"],
-                  overlap, r["notes"]]
+        values = [
+            None,                                  # Use? left blank for the reviewer
+            r["relevance"], r["match_type"], _competition_text(r), r["anchor"],
+            r["target_title"], None, r["section"],
+            r["existing_sentence"], r["modified_sentence"], r["notes"],
+        ]
         for c, v in enumerate(values, 1):
-            if c == 4:
-                _link(ws, i, 4, r["target_url"])
+            if c == 7:
+                _link(ws, i, 7, r["target_url"])
             else:
                 ws.cell(row=i, column=c, value=esc(v))
-        ws.cell(row=i, column=3).font = Font(bold=True)
-        _style_row(ws, i, len(GIVE_COLS), r["relevance"], 9, r["overlap_level"],
-                   r["notes"].startswith("Recommended"), 10)
+        ws.cell(row=i, column=5).font = Font(bold=True)          # anchor
+        _style_row(ws, i, len(GIVE_COLS), r["relevance"], 4, r["overlap_level"],
+                   r["notes"].startswith("Recommended"), 11)
 
 
 def write_receive(ws, rows: list[dict], target_url: str) -> None:
@@ -128,18 +144,20 @@ def write_receive(ws, rows: list[dict], target_url: str) -> None:
     ws.freeze_panes = "A3"
     ws.auto_filter.ref = f"A2:{get_column_letter(len(RECEIVE_COLS))}2"
     for i, r in enumerate(rows, start=3):
-        overlap = f"{r['overlap_level']}" + (f": {r['overlap_why']}" if r["overlap_why"] else "")
-        values = [None, r["source_title"], r["section"], r["existing_sentence"],
-                  r["modified_sentence"], r["anchor"], r["relevance"],
-                  r["match_type"], overlap, r["notes"]]
+        values = [
+            None,
+            r["relevance"], r["match_type"], _competition_text(r), r["anchor"],
+            r["source_title"], None, r["section"],
+            r["existing_sentence"], r["modified_sentence"], r["notes"],
+        ]
         for c, v in enumerate(values, 1):
-            if c == 1:
-                _link(ws, i, 1, r["source_url"])
+            if c == 7:
+                _link(ws, i, 7, r["source_url"])
             else:
                 ws.cell(row=i, column=c, value=esc(v))
-        ws.cell(row=i, column=6).font = Font(bold=True)
-        _style_row(ws, i, len(RECEIVE_COLS), r["relevance"], 9, r["overlap_level"],
-                   False, 10)
+        ws.cell(row=i, column=5).font = Font(bold=True)
+        _style_row(ws, i, len(RECEIVE_COLS), r["relevance"], 4, r["overlap_level"],
+                   False, 11)
 
 
 def write_summary(ws, results: list[dict]) -> None:
@@ -183,7 +201,12 @@ def build_workbook(results: list[dict]) -> bytes:
     write_summary(ws, results)
     for res in results:
         url = res["article"]["url"]
-        write_give(wb.create_sheet(sheet_name("Give", url)), res["give"])
+        give = res["give"]
+        topical = [r for r in give if r.get("is_topical", True)]
+        other = [r for r in give if not r.get("is_topical", True)]
+        write_give(wb.create_sheet(sheet_name("Give", url)), topical)
+        if other:
+            write_give(wb.create_sheet(sheet_name("Other", url)), other)
         write_receive(wb.create_sheet(sheet_name("Recv", url)), res["receive"], url)
     buf = io.BytesIO()
     wb.save(buf)

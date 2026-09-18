@@ -77,13 +77,15 @@ def keyword_evidence(tier: int, match_type: str, anchor: str) -> float:
     words = [w for w in (anchor or "").lower().split() if w]
     if len(words) < settings.KEYWORD_EVIDENCE_MIN_WORDS:
         return 0.0
-    if " ".join(words) in sel.GENERIC_ANCHORS:
+    phrase = " ".join(words)
+    if phrase in sel.GENERIC_ANCHORS or phrase in sel.GEOGRAPHIC_ANCHORS:
         return 0.0
     return settings.KEYWORD_EVIDENCE_FLOOR
 
 
 def final_score(semantic: float, lexical: float, anchor_score: float,
                 keyword_score: float = 0.0, title_sim: float = 0.0,
+                extra_floor: float = 0.0,
                 deorphan: bool = False, inbound: int = 0,
                 synthetic: bool = False, evidence: float = 0.0) -> float:
     """v3 scoring: four weighted signals plus floors from keyword evidence,
@@ -105,6 +107,9 @@ def final_score(semantic: float, lexical: float, anchor_score: float,
         relevance = max(relevance, settings.KEYWORD_HIT_FLOOR)
     if title_sim >= settings.TITLE_SIMILARITY_MIN:
         relevance = max(relevance, settings.TITLE_SIMILARITY_FLOOR)
+    # v4: awareness-month and conference disease matches carry their own floor.
+    if extra_floor > 0:
+        relevance = max(relevance, extra_floor)
 
     s = relevance * (1.0 - settings.W_ANCHOR + settings.W_ANCHOR * anchor_score)
     if synthetic:
@@ -183,5 +188,28 @@ def crowding_note(page: dict) -> str:
     return ""
 
 
-def overlap(source_page: dict, target_page: dict, anchor: str) -> tuple[str, str]:
-    return cannibalization.assess(source_page, target_page, anchor)
+def overlap(source_page: dict, target_page: dict, anchor: str,
+            cmap: dict | None = None) -> tuple[str, str, str]:
+    """Keyword competition between two pages. Returns (level, why, basis).
+
+    v4: when a Semrush-derived cannibalization map is available, it is used and
+    the basis is reported as "query data". That measures what the label claims:
+    whether the two pages rank for the same searches. Without the map the v3
+    title heuristic still runs, and the basis says so, so a writer can tell a
+    measured signal from an inferred one.
+    """
+    from engine import cannibalization_data
+
+    if cmap:
+        level, why = cannibalization_data.assess(
+            source_page.get("url", ""), target_page.get("url", ""), cmap)
+        if level:                       # map covered this pair
+            # The anchor check still applies: never point an outbound link at
+            # another page using the phrase this article ranks for itself.
+            a_level, a_why = cannibalization.assess(source_page, target_page, anchor)
+            if a_level == "High":
+                return "High", a_why, "anchor check"
+            return level, why, "query data"
+
+    level, why = cannibalization.assess(source_page, target_page, anchor)
+    return level, why, "title heuristic"

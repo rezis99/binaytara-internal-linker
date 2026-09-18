@@ -184,6 +184,101 @@ def _title_words(text: str) -> set[str]:
             if w not in _title_noise and len(w) >= 3}
 
 
+_AWARENESS_RE = [re.compile(p, re.I) for p in settings.AWARENESS_PATTERNS]
+
+# Disease terms used to match an article to its awareness or conference page.
+# Multi-word first so "stomach cancer" wins over a bare "stomach".
+DISEASE_TERMS = [
+    "renal cell carcinoma", "hepatocellular carcinoma", "colorectal cancer",
+    "non-small cell lung cancer", "small cell lung cancer", "head and neck cancer",
+    "multiple myeloma", "acute myeloid leukemia", "chronic myeloid leukemia",
+    "acute lymphoblastic leukemia", "chronic lymphocytic leukemia",
+    "non-hodgkin lymphoma", "hodgkin lymphoma", "mantle cell lymphoma",
+    "triple negative breast cancer", "urothelial carcinoma", "endometrial cancer",
+    "neuroendocrine tumor", "esophageal cancer", "oesophageal cancer",
+    "pancreatic cancer", "prostate cancer", "cervical cancer", "ovarian cancer",
+    "stomach cancer", "gastric cancer", "kidney cancer", "bladder cancer",
+    "breast cancer", "lung cancer", "liver cancer", "thyroid cancer",
+    "brain cancer", "skin cancer", "oral cancer", "colon cancer", "rectal cancer",
+    "testicular cancer", "bone cancer", "blood cancer", "childhood cancer",
+    "glioblastoma", "melanoma", "lymphoma", "leukemia", "leukaemia", "myeloma",
+    "sarcoma",
+]
+
+
+def article_diseases(article: dict) -> set[str]:
+    """Disease terms this article is actually about.
+
+    Weighted toward the H1 and title, because a passing mention in the body does
+    not make an article 'about' a disease. A body mention only counts when it
+    recurs, which is what distinguishes the article's subject from its asides.
+    """
+    found: set[str] = set()
+    headline = " ".join([
+        article.get("h1") or "", article.get("title_clean") or "",
+    ]).lower()
+    for term in DISEASE_TERMS:
+        if term in headline:
+            found.add(term)
+
+    body = " ".join(
+        (b.get("text") if isinstance(b, dict) else getattr(b, "text", ""))
+        for b in article.get("blocks", [])
+    ).lower()
+    for term in DISEASE_TERMS:
+        if term in found:
+            continue
+        if body.count(term) >= 3:
+            found.add(term)
+
+    # Drop a broader term when a more specific one covering it is present, so
+    # "stomach cancer" does not also match every generic "cancer" page.
+    for specific in list(found):
+        for other in list(found):
+            if other != specific and other in specific:
+                found.discard(other)
+    return found
+
+
+def is_awareness_page(page: dict) -> bool:
+    blob = f"{page.get('h1') or ''} {page.get('title_clean') or ''} {page.get('url') or ''}"
+    return any(rx.search(blob) for rx in _AWARENESS_RE)
+
+
+def awareness_and_conference_matches(
+    article: dict, pages: dict, exclude_urls: set[str]
+) -> dict[str, tuple[float, str]]:
+    """Find awareness-month pages and conference recaps for this article's diseases.
+
+    Both page types rank badly under embedding retrieval: an awareness page's
+    prose is deliberately general, and a conference recap covers many diseases
+    at once, so neither looks close to a specific article. Matching them on the
+    disease term directly is what surfaces them.
+
+    Returns {url: (score_floor, reason)}.
+    """
+    diseases = article_diseases(article)
+    if not diseases:
+        return {}
+
+    out: dict[str, tuple[float, str]] = {}
+    for url, page in pages.items():
+        if url in exclude_urls:
+            continue
+        blob = (f"{page.get('h1') or ''} {page.get('title_clean') or ''} "
+                f"{page.get('meta_description') or ''} {url}").lower()
+        hit = next((d for d in diseases if d in blob), None)
+        if not hit:
+            continue
+        if is_awareness_page(page):
+            out[url] = (settings.AWARENESS_MATCH_FLOOR,
+                        f"Awareness page for {hit}")
+        elif page.get("section") == "Conference":
+            out[url] = (settings.CONFERENCE_DISEASE_FLOOR,
+                        f"Conference coverage mentioning {hit}")
+    return out
+
+
 def title_similarity(source: dict, pages: dict,
                      exclude_urls: set[str]) -> dict[str, float]:
     """Jaccard similarity between the source article's H1/title and every
