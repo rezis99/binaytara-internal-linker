@@ -165,6 +165,53 @@ def scan_pages(terms: list[str], body_texts: dict[str, str],
     return {url: min(count / total, 1.0) for url, count in hits.items()}
 
 
+def reverse_scan(source_body: str, pages: dict, body_texts: dict[str, str],
+                 exclude_urls: set[str]) -> dict[str, float]:
+    """v5 BIDIRECTIONAL SCAN. The forward scan (scan_pages) asks: 'which pages
+    mention the SOURCE article's terms?' The reverse scan asks: 'which pages'
+    OWN disease terms appear in the SOURCE article?'
+
+    This catches the exact failure from the audit: Nepal's Cancer Burden has
+    'alcohol consumption' in its body text. The forward scan extracts terms from
+    the alcohol article and greps Nepal's page for them. But the REVERSE scan
+    extracts terms from Nepal's page (its disease terms, its H1 keywords) and
+    checks whether those appear in the alcohol article. If Nepal's page is about
+    'cancer burden' and the alcohol article mentions 'cancer burden,' that is a
+    bidirectional match the forward scan alone misses.
+
+    More importantly for the receive side: this finds pages that contain the
+    word 'alcohol' and are not yet linking to the alcohol article, by checking
+    each page's KEY terms against the source article's body.
+    """
+    if not source_body or not pages:
+        return {}
+
+    source_lower = source_body.lower()
+    results: dict[str, float] = {}
+
+    for url, page in pages.items():
+        if url in exclude_urls:
+            continue
+        # Extract that page's disease terms from its H1 and title.
+        page_diseases = article_diseases(page)
+        if not page_diseases:
+            continue
+        # Also extract key terms from the page's body (top disease bigrams).
+        page_body = body_texts.get(url, "")
+        page_terms: set[str] = set(page_diseases)
+        # Add frequent disease bigrams from the page's body.
+        for term in DISEASE_TERMS:
+            if page_body and page_body.count(term) >= 2:
+                page_terms.add(term)
+
+        # How many of THIS PAGE's terms appear in the SOURCE article?
+        hits = sum(1 for t in page_terms if t in source_lower)
+        if hits > 0:
+            results[url] = min(hits / max(len(page_terms), 1), 1.0)
+
+    return results
+
+
 def _title_words(text: str) -> set[str]:
     """Content words for title comparison. Uses a LIGHTER noise filter than body
     scanning: keeps domain-specific terms like 'cancer' that are generic in body

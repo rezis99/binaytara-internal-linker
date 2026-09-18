@@ -26,6 +26,35 @@ from indexer import chunker, embedder
 SECTIONS = ["TCN", "IJCCD", "Blog", "Conference", "Project", "Static", "Contributor"]
 
 
+def _review_context(article: dict, target: dict, cand: dict,
+                    kw: float, ts: float, match_type: str) -> str:
+    """v5: build a short context string that tells Claude WHY the tool suggested
+    this link, so Claude can judge whether the match is genuine or a false
+    positive from shared oncology vocabulary.
+
+    This goes into a 'Review Context' column in the Excel. When the user uploads
+    the Excel to Claude, the skill reads this column to make faster, more
+    accurate relevance decisions.
+    """
+    src_topic = article.get("h1") or article.get("title_clean") or ""
+    tgt_topic = target.get("h1") or target.get("title_clean") or ""
+    parts = [f"Source: {src_topic[:80]}", f"Target: {tgt_topic[:80]}"]
+
+    basis = []
+    if cand.get("raw_cosine", 0) >= 0.65:
+        basis.append(f"embedding similarity {cand['raw_cosine']:.2f}")
+    if kw >= 0.15:
+        basis.append(f"keyword overlap {kw:.0%}")
+    if ts >= 0.40:
+        basis.append(f"title similarity {ts:.0%}")
+    if match_type in ("Exact in text", "Synonym in text"):
+        basis.append(f"anchor phrase found in article text")
+    if not basis:
+        basis.append("weak signals only")
+    parts.append(f"Match basis: {'; '.join(basis)}")
+    return ". ".join(parts)
+
+
 def _sections_filter(page: dict, allowed: set[str] | None) -> bool:
     return allowed is None or page.get("section") in allowed
 
@@ -199,6 +228,8 @@ def links_to_give(article: dict, store: retrieval.Store,
                 "is_topical": bool(kw >= 0.15 or ts >= settings.TITLE_SIMILARITY_MIN
                                    or aw_floor > 0 or cand["raw_cosine"] >= 0.62),
                 "is_journal_target": is_journal,
+                "review_context": _review_context(
+                    article, target, cand, kw, ts, best["match_type"]),
                 "_page": target,
             })
 
@@ -363,6 +394,21 @@ def links_to_receive(article: dict, store: retrieval.Store,
     recv_exclude = {article["url"]} | already_inbound
 
     kw_scores = keyword_scan.scan_pages(article_terms, body_texts, recv_exclude)
+
+    # v5 BIDIRECTIONAL SCAN: also check which pages' own disease terms appear
+    # in the source article. This catches "Nepal's Cancer Burden mentions
+    # 'alcohol consumption' → should link to the alcohol article" which the
+    # forward scan misses because it only looks for the source's terms in
+    # other pages, not other pages' terms in the source.
+    source_body = " ".join(
+        (b.get("text") if isinstance(b, dict) else getattr(b, "text", ""))
+        for b in article.get("blocks", [])
+    )
+    reverse_scores = keyword_scan.reverse_scan(
+        source_body, store.pages, body_texts, recv_exclude)
+    # Merge: take the max of forward and reverse for each URL.
+    for url, score in reverse_scores.items():
+        kw_scores[url] = max(kw_scores.get(url, 0.0), score)
     title_sims = keyword_scan.title_similarity(article, store.pages, recv_exclude)
 
     fused: dict[str, dict] = {}
@@ -475,6 +521,8 @@ def links_to_receive(article: dict, store: retrieval.Store,
             "score": score,
             "is_topical": bool(kw >= 0.15 or ts >= settings.TITLE_SIMILARITY_MIN
                                or cand["raw_cosine"] >= 0.62),
+            "review_context": _review_context(
+                article, source, cand, kw, ts, best["match_type"]),
             "notes": notes,
         })
 

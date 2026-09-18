@@ -40,7 +40,7 @@ GIVE_COLS = [
     ("Keyword Competition", 30), ("Anchor Text", 22),
     ("Target Page Title", 34), ("Target Page Link", 46), ("Section", 12),
     ("Existing Sentence", 58), ("Modified Sentence", 58),
-    ("Notes", 42),
+    ("Review Context", 50), ("Notes", 42),
 ]
 RECEIVE_COLS = [
     ("Use?", 8), ("Relevance", 11), ("Match Type", 17),
@@ -123,7 +123,8 @@ def write_give(ws, rows: list[dict]) -> None:
             None,                                  # Use? left blank for the reviewer
             r["relevance"], r["match_type"], _competition_text(r), r["anchor"],
             r["target_title"], None, r["section"],
-            r["existing_sentence"], r["modified_sentence"], r["notes"],
+            r["existing_sentence"], r["modified_sentence"],
+            r.get("review_context", ""), r["notes"],
         ]
         for c, v in enumerate(values, 1):
             if c == 7:
@@ -148,7 +149,8 @@ def write_receive(ws, rows: list[dict], target_url: str) -> None:
             None,
             r["relevance"], r["match_type"], _competition_text(r), r["anchor"],
             r["source_title"], None, r["section"],
-            r["existing_sentence"], r["modified_sentence"], r["notes"],
+            r["existing_sentence"], r["modified_sentence"],
+            r.get("review_context", ""), r["notes"],
         ]
         for c, v in enumerate(values, 1):
             if c == 7:
