@@ -1,8 +1,3 @@
-Here is the complete, corrected code for `suggest.py`.
-
-The only change made is on line 271, where `level, why = rules.overlap(...)` has been updated to `level, why, basis = rules.overlap(...)` to correctly unpack all three variables and resolve the crash.
-
-```python
 """Orchestrator: an article in, two tables out.
 
 v3 changes
@@ -567,5 +562,3 @@ def analyse(article: dict, store: retrieval.Store,
         "llm": {"available": llm_ok, "provider": llm_provider},
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
-
-```
