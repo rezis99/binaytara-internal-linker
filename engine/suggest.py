@@ -330,7 +330,8 @@ def links_to_give(article: dict, store: retrieval.Store,
                     if force_lower:
                         b = "Lower"
 
-                                       level, why, basis = rules.overlap(article, target, best["anchor"], cmap)
+                    level, why, basis = rules.overlap(
+                        article, target, best["anchor"], cmap)
                     kw_note = f"Keyword match: {kw:.0%}" if kw >= 0.10 else ""
                     ts_note = (f"Same-topic match: {ts:.0%}"
                                if ts >= settings.TITLE_SIMILARITY_MIN else "")
