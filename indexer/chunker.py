@@ -51,6 +51,9 @@ def chunk_page(url: str, blocks: list[dict]) -> list[dict]:
                 "sentences": g,
                 "word_count": len(text.split()),
                 "placement_ok": True,
+                # v5b: carry the block's existing links so downstream code can
+                # detect sentences that already contain a hyperlink.
+                "existing_links": b.get("links", []),
             })
     return chunks
 

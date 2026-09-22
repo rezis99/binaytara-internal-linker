@@ -46,6 +46,31 @@ _NOISE = {
 
 
 @lru_cache(maxsize=1)
+def _hub_pages_config() -> dict:
+    """Load planned /cancer-types/ hub pages config."""
+    path = settings.ROOT / "config" / "hub_pages.json"
+    try:
+        raw = json.loads(path.read_text("utf-8"))
+        return raw.get("cancer_types", {})
+    except Exception:
+        return {}
+
+
+def hub_page_note(anchor: str) -> str:
+    """If the anchor matches a planned cancer-type hub page, return a note.
+    If the hub is live, return its URL. If not yet live, return a planning note."""
+    config = _hub_pages_config()
+    anchor_lower = (anchor or "").lower().strip()
+    for cancer_type, info in config.items():
+        if cancer_type in anchor_lower or anchor_lower in cancer_type:
+            if info.get("live"):
+                return f"HUB_LIVE:{info['url']}"
+            return (f"A dedicated {info['url']} hub page is planned ({info['phase']}). "
+                    "Link to the best current page for now; update when the hub goes live.")
+    return ""
+
+
+@lru_cache(maxsize=1)
 def _synonym_map() -> dict[str, list[str]]:
     path = settings.ROOT / "config" / "oncology_synonyms.json"
     try:

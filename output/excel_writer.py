@@ -12,6 +12,7 @@ from hashlib import blake2b
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+import openpyxl.comments
 
 HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
@@ -137,14 +138,17 @@ def write_give(ws, rows: list[dict]) -> None:
 
 
 def write_receive(ws, rows: list[dict], target_url: str) -> None:
+    # v5b: Row 1 is the header. The target URL goes in a named range / comment
+    # on A1 so Excel filtering works on the "Use?" column properly.
     _header(ws, RECEIVE_COLS)
-    ws.insert_rows(1)
-    note = ws.cell(row=1, column=1,
-                   value=esc(f"All rows below suggest linking TO: {target_url}"))
-    note.font = Font(bold=True, italic=True)
-    ws.freeze_panes = "A3"
-    ws.auto_filter.ref = f"A2:{get_column_letter(len(RECEIVE_COLS))}2"
-    for i, r in enumerate(rows, start=3):
+    # Set the sheet tab color to distinguish from Give sheets
+    ws.sheet_properties.tabColor = "4472C4"
+    # Put the target URL as a comment on the header row, not as a data row.
+    ws.cell(row=1, column=1).comment = openpyxl.comments.Comment(
+        f"All rows suggest linking TO: {target_url}", "Binaytara Linker")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(RECEIVE_COLS))}1"
+    for i, r in enumerate(rows, start=2):
         values = [
             None,
             r["relevance"], r["match_type"], _competition_text(r), r["anchor"],

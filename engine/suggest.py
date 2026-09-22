@@ -52,6 +52,16 @@ def _review_context(article: dict, target: dict, cand: dict,
     if not basis:
         basis.append("weak signals only")
     parts.append(f"Match basis: {'; '.join(basis)}")
+
+    # v5b: flag if the anchor matches a planned hub page
+    anchor = ""
+    if "anchor" in str(cand):
+        anchor = cand.get("anchor", "")
+    hub_note = keyword_scan.hub_page_note(
+        target.get("h1") or target.get("title_clean") or "")
+    if hub_note and not hub_note.startswith("HUB_LIVE:"):
+        parts.append(hub_note)
+
     return ". ".join(parts)
 
 
@@ -206,6 +216,13 @@ def links_to_give(article: dict, store: retrieval.Store,
             if aw_reason:
                 ts_note = ". ".join(x for x in (ts_note, aw_reason) if x)
 
+            # v5b: detect existing links in this sentence/block.
+            existing_in_block = chunk.get("existing_links", [])
+            link_warn = ""
+            if existing_in_block:
+                link_urls = [u for u, _a in existing_in_block]
+                link_warn = f"This paragraph already has {len(link_urls)} link(s): {', '.join(link_urls[:3])}"
+
             group.append({
                 "block_index": chunk["block_index"],
                 "existing_sentence": chunk["text"],
@@ -222,7 +239,7 @@ def links_to_give(article: dict, store: retrieval.Store,
                 "overlap_why": why,
                 "overlap_basis": basis,
                 "score": score,
-                "extra_note": ". ".join(x for x in (name_note, conf_note) if x),
+                "extra_note": ". ".join(x for x in (name_note, conf_note, link_warn) if x),
                 "keyword_note": kw_note,
                 "title_sim_note": ts_note,
                 "is_topical": bool(kw >= 0.15 or ts >= settings.TITLE_SIMILARITY_MIN
@@ -313,7 +330,7 @@ def links_to_give(article: dict, store: retrieval.Store,
                     if force_lower:
                         b = "Lower"
 
-                    level, why, basis = rules.overlap(article, target, best["anchor"])
+                    level, why = rules.overlap(article, target, best["anchor"])
                     kw_note = f"Keyword match: {kw:.0%}" if kw >= 0.10 else ""
                     ts_note = (f"Same-topic match: {ts:.0%}"
                                if ts >= settings.TITLE_SIMILARITY_MIN else "")

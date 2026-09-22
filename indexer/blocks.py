@@ -18,6 +18,40 @@ _key_re = re.compile(sel.KEY_TAKEAWAYS_RE, re.I)
 _ref_re = re.compile(sel.REFERENCES_RE, re.I)
 _cap_re = re.compile(sel.CAPTION_RE, re.I)
 _dis_re = re.compile(sel.DISCLAIMER_RE, re.I)
+
+# v5b: cancer-type terms for statistics-list detection. Multi-word terms first
+# so "breast cancer" matches before a bare "breast."
+_CANCER_TYPES_FOR_LIST = [
+    "renal cell carcinoma", "hepatocellular carcinoma", "colorectal cancer",
+    "non-small cell lung cancer", "small cell lung cancer", "head and neck cancer",
+    "multiple myeloma", "urothelial carcinoma", "neuroendocrine tumor",
+    "squamous cell carcinoma", "biliary tract cancer", "triple negative breast cancer",
+    "esophageal cancer", "pancreatic cancer", "prostate cancer", "cervical cancer",
+    "ovarian cancer", "stomach cancer", "gastric cancer", "kidney cancer",
+    "bladder cancer", "breast cancer", "lung cancer", "liver cancer",
+    "thyroid cancer", "brain cancer", "skin cancer", "oral cancer",
+    "colon cancer", "rectal cancer", "testicular cancer", "bone cancer",
+    "blood cancer", "endometrial cancer", "uterine cancer", "vulvar cancer",
+    "anal cancer", "tongue cancer", "throat cancer", "eye cancer",
+    "gallbladder cancer", "bile duct cancer", "adrenal cancer",
+    "glioblastoma", "melanoma", "lymphoma", "leukemia", "leukaemia",
+    "myeloma", "sarcoma", "mesothelioma", "liposarcoma",
+]
+
+
+def _count_cancer_types(text: str) -> int:
+    """Count how many distinct cancer types a paragraph mentions."""
+    lower = (text or "").lower()
+    found: set[str] = set()
+    for term in _CANCER_TYPES_FOR_LIST:
+        if term in lower:
+            # Avoid double-counting: "breast cancer" should not also count the
+            # shorter "breast" if we add more terms later. Use the full term as
+            # the dedup key.
+            base = term.replace(" cancer", "").replace(" carcinoma", "")
+            if base not in found:
+                found.add(base)
+    return len(found)
 _attr_re = re.compile(sel.ATTRIBUTION_RE, re.I)
 _cred_re = re.compile(sel.CREDENTIAL_RE)
 
@@ -149,6 +183,14 @@ def classify(blocks: list[Block], meta_description: str = "") -> list[Block]:
             continue
         if b.word_count < settings.MIN_BLOCK_WORDS:
             b.skip_reason = "SHORT"
+            continue
+        # v5b: Statistics-list paragraphs. A paragraph mentioning 4+ distinct
+        # cancer types is a data list (e.g., "17% for breast cancer, 10% for
+        # colorectal and prostate cancer, 30% for biliary tract cancer...").
+        # Linking one disease in a list of many is misleading: it implies the
+        # destination has those specific statistics. Skip entirely.
+        if _count_cancer_types(b.text) >= 4:
+            b.skip_reason = "STATISTICS_LIST"
             continue
         # First substantive paragraph (SOP Rule 1). Guard 1 handles a short dek,
         # which is already filtered by the SHORT rule above. Guard 2 catches a

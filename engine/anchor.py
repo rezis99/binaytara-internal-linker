@@ -47,7 +47,7 @@ def expand(term: str) -> list[str]:
 
 
 def tokens(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9][a-z0-9\-']*", (text or "").lower())
+    return re.findall(r"[a-z0-9][a-z0-9\-'\u2019]*", (text or "").lower())
 
 
 def ngrams(text: str, lo: int | None = None, hi: int | None = None) -> list[str]:
@@ -63,7 +63,9 @@ def ngrams(text: str, lo: int | None = None, hi: int | None = None) -> list[str]
     # Only consider the part of a title before a colon or dash: "Prostate Cancer
     # and Obesity: Current Hypotheses" should yield the subject, not the subtitle.
     head = re.split(r"[:\u2013\u2014]|\s-\s", text or "")[0] or (text or "")
-    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-']*", head)
+    # v5b: include Unicode right-single-quote (\u2019) so "Nepal's" stays as one
+    # token instead of splitting into "Nepal" + "s".
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-'\u2019]*", head)
     scored = []
     for n in range(lo, hi + 1):
         for i in range(len(words) - n + 1):
